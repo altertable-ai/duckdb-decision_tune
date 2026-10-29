@@ -1,7 +1,7 @@
-#include "decision_tune/decide_functions.hpp"
+#include "decide_onnx/decide_functions.hpp"
 
-#include "decision_tune/model_store.hpp"
-#include "decision_tune/state_text.hpp"
+#include "decide_onnx/model_store.hpp"
+#include "decide_onnx/state_text.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -13,7 +13,7 @@
 #include "duckdb/planner/expression.hpp"
 
 namespace duckdb {
-namespace decision_tune {
+namespace decide_onnx {
 
 //! One question about one state.
 struct Decision {
@@ -42,7 +42,7 @@ public:
 	}
 
 	string TaskType() const override {
-		return "DecisionTuneTask";
+		return "DecideOnnxTask";
 	}
 
 private:
@@ -200,17 +200,18 @@ static void YesNoFunction(DataChunk &args, ExpressionState &state, Vector &resul
 			result.SetValue(row, Value(LogicalType::DOUBLE));
 			continue;
 		}
-		decisions.push_back(Decision {StateText(state_value), question.ToString(), {"yes", "no"}});
+		// The reference asks a yes/no question as the choice {no, yes}.
+		decisions.push_back(Decision {StateText(state_value), question.ToString(), {"no", "yes"}});
 		rows.push_back(row);
 	}
 	auto probabilities = ScoreDecisions(state.GetContext(), decisions);
 	for (idx_t i = 0; i < decisions.size(); i++) {
-		result.SetValue(rows[i], Value::DOUBLE(probabilities[i][0]));
+		result.SetValue(rows[i], Value::DOUBLE(probabilities[i][1]));
 	}
 }
 
 //===--------------------------------------------------------------------===//
-// decision_tune_tokenize(text)
+// decide_onnx_tokenize(text)
 //===--------------------------------------------------------------------===//
 static void TokenizeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto count = PrepareResult(args, result);
@@ -225,7 +226,7 @@ static void TokenizeFunction(DataChunk &args, ExpressionState &state, Vector &re
 			tokenizer = ModelStore::Instance().GetTokenizer(state.GetContext());
 		}
 		vector<Value> ids;
-		for (auto id : EncodeText(*tokenizer, StringValue::Get(text))) {
+		for (auto id : tokenizer->Encode(StringValue::Get(text))) {
 			ids.push_back(Value::INTEGER(static_cast<int32_t>(id)));
 		}
 		result.SetValue(row, Value::LIST(LogicalType::INTEGER, std::move(ids)));
@@ -247,10 +248,10 @@ void RegisterDecideFunctions(ExtensionLoader &loader) {
 	yes_no.SetFallible();
 	loader.RegisterFunction(yes_no);
 
-	ScalarFunction tokenize("decision_tune_tokenize", {}, LogicalType::LIST(LogicalType::INTEGER), TokenizeFunction);
+	ScalarFunction tokenize("decide_onnx_tokenize", {}, LogicalType::LIST(LogicalType::INTEGER), TokenizeFunction);
 	tokenize.GetSignature().AddParameter("text", LogicalType::VARCHAR);
 	loader.RegisterFunction(tokenize);
 }
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

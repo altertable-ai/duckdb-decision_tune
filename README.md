@@ -1,13 +1,13 @@
-# decision_tune: decisions in DuckDB
+# decide_onnx: decision models in DuckDB
 
-`decision_tune` runs [DecisionTune 1.0](https://decisiontune.com/) inside DuckDB. DecisionTune is a 395M decision
-model ([model card](https://huggingface.co/decision-tune/decisiontune-1.0),
-[code](https://github.com/decision-tune/decision-tune)). You give it a state, a question and options. It picks one
-option and gives a probability for each, or it gives P(yes) for a yes/no question. It does one encoder pass and
-never generates text.
+`decide_onnx` runs [vela3-fast](https://huggingface.co/vllm-sr/vela3-fast) inside DuckDB. vela3-fast is the
+0.4B member of the Vela 3.0 family from vLLM Semantic Router and KR Labs: an UltraBERT-380M encoder, Apache-2.0.
+You give it a state, a question and options. It picks one option and gives a probability for each, or it gives
+P(yes) for a yes/no question. It does one encoder pass and never generates text. The extension runs the model's
+decision backbone only. The span, entity and router adapters of vela3-fast are not included.
 
 Decision models of this kind are also offered as hosted APIs, such as TypeSafe's [Jev](https://typesafe.ai) and
-OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions). DecisionTune is an open-weights
+OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions). vela3-fast is an open-weights
 model that runs on your own machine. [Compared with hosted decision APIs](#compared-with-hosted-decision-apis)
 explains the trade-offs.
 
@@ -15,7 +15,7 @@ With this extension, routing, tagging and triage are SQL queries. They need no P
 network runs on CPU through a statically linked [ONNX Runtime](https://onnxruntime.ai/).
 
 ```sql
-LOAD decision_tune;
+LOAD decide_onnx;
 
 FROM tickets DECIDE (
     CHOOSE 'Which team should handle this customer message?' AMONG (
@@ -29,28 +29,29 @@ FROM tickets DECIDE (
 
 | subject       | team     | team_confidence | team_probabilities                       | refund | refund_confidence | refund_probabilities |
 |---------------|----------|----------------:|------------------------------------------|--------|------------------:|----------------------|
-| Broken mug    | shipping | 0.78            | {billing=0.15, shipping=0.78, tech=0.07} | true   | 1.00              | {yes=1.00, no=0.00}  |
-| Double charge | billing  | 0.73            | {billing=0.73, shipping=0.16, tech=0.11} | true   | 0.87              | {yes=0.87, no=0.13}  |
-| Login loop    | tech     | 0.99            | {billing=0.00, shipping=0.00, tech=0.99} | false  | 0.98              | {yes=0.02, no=0.98}  |
+| Broken mug    | shipping | 0.72            | {billing=0.28, shipping=0.72, tech=0.01} | true   | 0.99              | {yes=0.99, no=0.01}  |
+| Double charge | billing  | 1.00            | {billing=1.00, shipping=0.00, tech=0.00} | false  | 0.89              | {yes=0.11, no=0.89}  |
+| Login loop    | tech     | 1.00            | {billing=0.00, shipping=0.00, tech=1.00} | false  | 0.94              | {yes=0.06, no=0.94}  |
 
 ## Install
 
-`decision_tune` is meant for DuckDB 2.0. Build it from source (see [Building](#building)), then load
-`build/release/extension/decision_tune/decision_tune.duckdb_extension`. The draft for the community extensions
+`decide_onnx` is meant for DuckDB 2.0. Build it from source (see [Building](#building)), then load
+`build/release/extension/decide_onnx/decide_onnx.duckdb_extension`. The draft for the community extensions
 repository is in `description.yml`. Once that is published:
 
 ```sql
-INSTALL decision_tune FROM community;
-LOAD decision_tune;
+INSTALL decide_onnx FROM community;
+LOAD decide_onnx;
 ```
 
 `LOAD` adds the `DECIDE` syntax to every connection. A connection that was already open switches when its current
-query ends, and this includes the connection that runs `LOAD`. So send `LOAD decision_tune` and the first `DECIDE`
+query ends, and this includes the connection that runs `LOAD`. So send `LOAD decide_onnx` and the first `DECIDE`
 query as two separate statements, not as one string.
 
-The first query that runs the model downloads DecisionTune 1.0 from Hugging Face. That is `tokenizer.json` (3.6 MB)
-and `onnx/model.onnx` (1.58 GB), pinned to one repository commit. The extension checks each file against the
-SHA-256 in the release's `manifest.json` and caches it in `~/.duckdb/decision_tune/1.0/`. The model loads when a
+The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v1/`.
+That is `tokenizer.json` (3.5 MB) and `model.onnx` (1.52 GB), an ONNX export of the decision backbone of one pinned
+commit of the Hugging Face repository (see [scripts/export](scripts/export/README.md)). The extension checks each
+file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v1/`. The model loads when a
 query first needs an answer, not when the query is bound, so `DESCRIBE` of a `DECIDE` query stays fast. The
 optimizer may compute a call whose arguments are all constants while it plans the query.
 
@@ -73,10 +74,10 @@ DECIDE (
 
 | Part | Meaning |
 |---|---|
-| `CHOOSE question AMONG (…) AS name` | Pick one of at least 2 options. A key is an identifier or a string. The description is what the model reads. Without a description, the model reads the key with `_` replaced by spaces. |
+| `CHOOSE question AMONG (…) AS name` | Pick one of at least 2 options. A key is an identifier or a string. The model reads `key: description`, or the key alone when there is no description. |
 | `ASK question AS name` | A yes/no question. |
 | `AS name` | Names the answer columns. Required. |
-| `GIVEN` | What the model reads: the *state*. With one expression, the state is its text. With several, it is `name: value \| name: value`, the same as a decision-tune recipe that reads several columns. Required. |
+| `GIVEN` | What the model reads: the *state*. With one expression, the state is its text. With several, it is a compact JSON object, `{"name":value,...}`, the way the reference reads a JSON state. Required. |
 
 For each question, the clause adds three columns:
 
@@ -122,9 +123,10 @@ FROM messages;
 - `decision_choose(state, question, options)` returns
   `STRUCT(choice VARCHAR, confidence DOUBLE, probabilities MAP(VARCHAR, DOUBLE))`. The probabilities sum to 1.
   `options` can be any of these:
-  - a list of texts, such as `['billing', 'shipping']`. Each text is its own key.
-  - a `MAP` of key to description, such as `MAP {'billing': 'Billing: charges, refunds'}`.
-  - a `STRUCT` of key to description, such as `{billing: 'Billing: charges, refunds'}`.
+  - a list of texts, such as `['billing', 'shipping']`. Each text is its own key, and the model reads it as is.
+  - a `MAP` of key to description, such as `MAP {'billing': 'charges, refunds, invoices'}`. The model reads
+    `billing: charges, refunds, invoices`.
+  - a `STRUCT` of key to description, such as `{billing: 'charges, refunds, invoices'}`, read the same way.
 - `decision_yes_no(state, question)` returns P(yes) as a `DOUBLE`.
 
 Both functions also accept the clause's words:
@@ -135,25 +137,24 @@ SELECT decision_choose('Which team?' AMONG (billing 'Billing: charges', tech 'Te
 FROM tickets;
 ```
 
-The state can be any value. It is read the way the reference engine reads it:
-- Text is read as is.
-- A `STRUCT`, a `MAP` or a JSON object is read as `key: value | key: value`. Text values are read as is, `NULL`
-  as empty, and other values as compact JSON.
-- Other values are read as compact JSON (`3`, `true`, `["a","b"]`). Dates, timestamps and UUIDs are read as their
-  text.
+The state can be any value. It is read the way the reference (`ub_d3_common.py`) reads a state:
+- Text is read as is, and so is a JSON string.
+- A `STRUCT`, a `MAP`, a list, a number, a boolean or any other JSON value is read as compact JSON, such as
+  `{"subject":"Broken mug","n":3,"tags":["a","b"],"note":null}`.
+- Dates, timestamps and UUIDs are read as their text.
 
-A `NULL` state, question or options gives a `NULL` result. A prompt longer than the model's 8,192-token context
+A `NULL` state, question or options gives a `NULL` result. A prompt longer than the model's 32,768-token context
 raises an error. The reference refuses such prompts too and does not truncate them. Shorten the input, for example
-with `left(message, 20000)`, or wrap the call in `TRY(…)` to get `NULL` instead.
+with `left(message, 20000)`, or wrap the call in `TRY(…)` to get `NULL` instead. Long prompts are slow on a CPU
+(see [Performance](#performance)).
 
-`decision_tune_tokenize(text)` returns the token ids the model sees for a text. Use it to check lengths.
+`decide_onnx_tokenize(text)` returns the token ids the model sees for a text. Use it to check lengths.
 
 ### Writing good questions
 
-DecisionTune scores the options you give it. The quality of a decision depends on the question, the options and
-the state. Upstream's [prompting guide](https://github.com/decision-tune/decision-tune/blob/main/skills/decisiontune/references/prompting.md)
-gives these tips:
-- **Describe every option.** `shipping 'Shipping: delivery, lost or damaged packages'` gives much better results
+vela3-fast scores the options you give it. The quality of a decision depends on the question, the options and
+the state. These tips help:
+- **Describe every option.** `shipping 'delivery, lost or damaged packages'` usually gives better results
   than `shipping` alone.
 - **Offer a way out**, such as `none 'None of these: spam, praise, or a message for no team'`.
 - **Write down the criteria.** "Is this urgent?" alone gives weak results. Say what urgent means.
@@ -161,26 +162,35 @@ gives these tips:
 - **Put only what a person would read into `GIVEN`.** Leave out ids and timestamps.
 - **Phrase yes/no questions so that yes is the case you act on.** Then threshold `name_probabilities['yes']`.
 
-The model's probabilities are not calibrated. Pick thresholds on your own labeled rows, and send the unsure rows
-to a person.
+vela3-fast was trained on English. The model's probabilities are not calibrated. Pick thresholds on your own
+labeled rows, and send the unsure rows to a person.
 
 ## Performance
 
-Every question for every row is one forward pass of the 395M encoder. The extension spreads the decisions of each
+Every question for every row is one forward pass of the 380M encoder. The extension spreads the decisions of each
 chunk of rows over DuckDB's worker threads, so `SET threads` sets the parallelism. ONNX Runtime itself runs
 single-threaded. Measured on an Apple M4 Pro (10 performance and 4 efficiency cores), with tickets of about 20
 tokens and one yes/no question each:
 
 | Threads | Decisions per second |
 |---|---|
-| 1 | 17 (about 60 ms each) |
-| 4 | 59 |
-| 8 | 57 |
-| 14 | 79 |
+| 1 | 15 (about 65 ms each) |
+| 4 | 37 |
+| 8 | 47 |
+| 14 | 50 |
 
-Throughput stops growing after a few threads because memory bandwidth limits it, not compute. The published ONNX
-graph scores one prompt per pass, and each pass reads all 1.6 GB of float32 weights. 10,000 rows with two
-questions therefore take about four minutes.
+Throughput stops growing after a few threads because memory bandwidth limits it, not compute. The ONNX graph
+scores one prompt per pass, and each pass reads all 1.5 GB of float32 weights. 10,000 rows with two questions
+therefore take about seven minutes.
+
+Long prompts cost much more, because 8 of the 24 layers attend over the whole prompt. One prompt runs on one core:
+
+| Prompt tokens | Time | Peak memory of the process |
+|---|---|---|
+| 2,000 | 3.4 s | 2.3 GB |
+| 8,000 | 28 s | 3.5 GB |
+| 16,000 | 99 s | 4.7 GB |
+| 32,000 | 6.3 min | 7.2 GB |
 
 DuckDB only computes the decisions that a query uses. `SELECT count(*) FROM t DECIDE (...)` does not run the
 model, and neither does a column that you do not select.
@@ -191,24 +201,25 @@ question about the same state twice is scored once, and so is a query that you r
 ### Compared with hosted decision APIs
 
 TypeSafe's Jev and OpenAI's Decisions API answer the same kind of question (pick an option, or give P(yes)) over
-HTTP. The figures below are as published in October 2026. Only the DecisionTune throughput was measured here.
+HTTP. The figures below are as published in October 2026. Only the vela3-fast throughput was measured here.
 
-| | `decision_tune` (DecisionTune 1.0) | [Jev](https://openrouter.ai/docs/guides/community/jev) (TypeSafe) | [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (OpenAI) |
+| | `decide_onnx` (vela3-fast) | [Jev](https://openrouter.ai/docs/guides/community/jev) (TypeSafe) | [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (OpenAI) |
 |---|---|---|---|
 | Runs | In DuckDB, on your CPU | Hosted API | Hosted API (`gpt-6-luna`) |
-| Weights | Open, Apache-2.0, 395M parameters | Closed | Closed |
+| Weights | Open, Apache-2.0, 380M parameters | Closed | Closed |
 | Price | No per-call cost | $0.042 per million input tokens, output free[^typesafe] | $0.10 per million input tokens, output free[^openai] |
-| Speed | About 60 ms per decision on one core; 17 to 79 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
-| Decision Index 0.2.1 | 29.57[^card] | 57.89[^kit] | Not published |
-| Context | 8,192 tokens | 262,144 tokens[^openrouter] | Not published |
+| Speed | About 65 ms per decision on one core; 15 to 50 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
+| Decision Index | 50.36 public index, 29.27 full score (board 0.4.1)[^card] | 57.89 (kit 0.2.1)[^kit] | Not published |
+| Context | 32,768 tokens | 262,144 tokens[^openrouter] | Not published |
 | Your data | Stays on your machine | Sent to TypeSafe | Sent to OpenAI |
 
 The [Decision Index](https://github.com/apolinario/decision-index) is chance-corrected: 0 is random guessing and
-100 is perfect. On version 0.2.1, Jev scores about twice what DecisionTune 1.0 does. OpenAI has published no Decision
-Index score; TechCrunch reports that it ranks 14th on Artificial Analysis's Decision Index, where the latest Jev
-ranks 3rd.[^techcrunch]
+100 is perfect. vela3-fast has the highest public index of the board's models up to 500M parameters. The two scores
+in the table come from different versions of the index, so they do not compare directly. OpenAI has published no
+Decision Index score; TechCrunch reports that it ranks 14th on Artificial Analysis's Decision Index, where the
+latest Jev ranks 3rd.[^techcrunch]
 
-So the hosted models are more accurate, and at these prices 10,000 rows cost cents. Use this extension when the data
+So the hosted models are likely more accurate, and at these prices 10,000 rows cost cents. Use this extension when the data
 must not leave the machine, when the queries must work offline, when the result must be reproducible with a pinned
 model, or when you want the decisions inside a SQL query without managing API keys, rate limits and retries. Check
 the accuracy on a sample of your own labeled rows either way.
@@ -221,8 +232,8 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 [^openai]: [OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions): `POST /v1/decisions`,
     up to 400 questions per request about one shared input.
 [^techcrunch]: [TechCrunch, 22 October 2026](https://techcrunch.com/2026/10/22/openai-makes-its-jev-competitor-widely-available-as-decision-model-competition-heats-up/).
-[^card]: [DecisionTune 1.0 model card](https://huggingface.co/decision-tune/decisiontune-1.0): one complete run
-    (raw 46.80); a second seed scored 29.13.
+[^card]: [vela3-fast model card](https://huggingface.co/vllm-sr/vela3-fast): Decision Index 0.4.1 board, 28 October
+    2026. The public index is the 37 public benchmarks; the full score adds the board's private tests.
 [^kit]: [Decision Index reproduction kit](https://github.com/apolinario/decision-index), reference score in its
     0.2.1 parity test.
 [^openrouter]: [OpenRouter Jev guide](https://openrouter.ai/docs/guides/community/jev). Requests over about 32,000
@@ -232,66 +243,71 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `decision_tune_model_url` | `'https://huggingface.co/decision-tune/decisiontune-1.0/resolve/<commit>'` | The URL the files are downloaded from. A local directory also works. |
-| `decision_tune_cache_dir` | `'~/.duckdb/decision_tune/1.0'` | Where the downloaded files are cached. |
-| `decision_tune_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`, or is a clone of the Hugging Face repository. The files are not checksummed. |
+| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v1'` | The URL the files are downloaded from. A local directory also works. |
+| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v1'` | Where the downloaded files are cached. |
+| `decide_onnx_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`. The files are not checksummed. |
 
 ### Offline use
 
-`decision_tune_models()` lists each file with its URL, SHA-256, size, local path and whether it is cached:
+`decide_onnx_models()` lists each file with its URL, SHA-256, size, local path and whether it is cached:
 
 ```sql
-SELECT file_name, cached, local_path FROM decision_tune_models();
+SELECT file_name, cached, local_path FROM decide_onnx_models();
 ```
 
 To use the extension on a machine without internet access, do one of these:
 - Copy `tokenizer.json` and `model.onnx` into the cache directory.
-- Set `decision_tune_model_path` to a directory that holds them, such as a `git clone` of the model repository.
+- Set `decide_onnx_model_path` to a directory that holds them, such as the `out/` directory of
+  [scripts/export](scripts/export/README.md).
 
 ## How it works
 
-- **Tokenizer.** DecisionTune uses ModernBERT's byte-level BPE tokenizer. `src/tokenizer.cpp` is a C++ port of
-  the parts of Hugging Face `tokenizers` that this tokenizer uses:
-  - added tokens, with special tokens matched on the raw text and the others after normalization
-  - NFC normalization, through DuckDB's bundled utf8proc
+- **Tokenizer.** vela3-fast uses UltraBERT's byte-level BPE tokenizer. `src/tokenizer.cpp` is a C++ port of the
+  parts of Hugging Face `tokenizers` that this tokenizer uses:
+  - added tokens, matched on the raw text, with their `lstrip` and `rstrip` flags
   - the GPT-2 pre-tokenizer regex
   - BPE merges
 
-  It reads the published `tokenizer.json`.
-- **Prompt.** `src/decision_model.cpp` builds the sequence the way `engine.py` does:
-  `[CLS] question [SEP] ([MASK] option)+ [SEP] state [SEP]`. It replaces special tokens in the input text with
-  spaces. A softmax over the logits that the published ONNX graph returns for the `[MASK]` positions gives the
-  probabilities. The result has no calibration temperature, no option filtering and no truncation.
+  It reads the published `tokenizer.json`. It also supports NFC normalization, which this tokenizer does not use.
+- **Prompt.** `src/decision_model.cpp` builds the sequence the way `DecisionEncoder.encode` in `vela3_encoder.py`
+  does: `<|endoftext|> [Q] question ([O] option)+ [SEP_SCHEMA] [SEG_user] state <|endoftext|>`. The markers are
+  token ids after the tokenizer's vocabulary, so no input text can produce them. The ONNX graph returns one logit
+  per `[O]` position, from the model's readout head (a cosine between the option and the pooled state, plus an
+  MLP). A softmax over them gives the probabilities. A yes/no question is the choice between `no` and `yes`. The
+  result has no calibration temperature, no option filtering and no truncation.
+- **Graph.** `scripts/export/export_onnx.py` exports the decision backbone and checks it against the published
+  PyTorch code. It keeps memory linear in the prompt length: the sliding-window layers attend in blocks, and the
+  global layers use ONNX Runtime's flash attention (`com.microsoft.MultiHeadAttention`).
 - **Syntax.** `DECIDE` and the `AMONG` / `GIVEN` call forms are additions to DuckDB's PEG grammar. They are
-  registered as the `decision_tune` grammar extension (`src/decide_grammar.cpp`). They only add rules and choices
+  registered as the `decide_onnx` grammar extension (`src/decide_grammar.cpp`). They only add rules and choices
   and replace no stock rule, so they combine with other grammar extensions (such as
   [timestral](https://github.com/altertable-ai/duckdb-timestral)). `SET active_grammar_extensions` turns them off
   for a connection.
 
-The parity tests in `test/sql/parity_*.test` compare the extension with Hugging Face `tokenizers` and the Python
-ONNX Runtime (`scripts/parity/make_fixtures.py`):
-- Token ids match exactly on 392 cases. The cases cover multilingual text, emoji, combining marks, runs of spaces,
-  contractions and special tokens. A further fuzz run over 20,000 random multilingual strings also matched.
-- Probabilities match to within 1e-4. This includes the README example of the model card: Shipping 71.2%,
-  Tech support 20.9%, Billing 7.9%.
+The parity tests in `test/sql/parity_*.test` compare the extension with the published vela3-fast code, run in
+PyTorch on the CPU (`scripts/export/make_fixtures.py`):
+- Token ids match exactly on 394 cases. The cases cover multilingual text, emoji, combining marks, runs of spaces,
+  contractions and special tokens.
+- Probabilities match to within 1e-4 on 14 decisions: choices with and without descriptions, yes/no questions, and
+  text and JSON states.
 
 ## Limitations
 
-- DecisionTune scores options. It does not reason step by step, and its probabilities are not calibrated. Do not
-  use it for high-risk decisions about people (hiring, credit, housing, health, legal) without independent
-  validation (see the model card).
+- vela3-fast scores options. It does not reason step by step, and its probabilities are not calibrated. It was
+  trained on English. Do not use it for high-risk decisions about people (hiring, credit, housing, health, legal)
+  without independent validation.
 - The ONNX graph takes one sequence at a time. Throughput comes from running many rows in parallel, not from
   batching.
 - The extension is not available for DuckDB-WASM, Windows MinGW or Linux musl builds, because ONNX Runtime does
   not support them.
-- The model needs about 1.6 GB of memory once it is loaded. It is loaded once per process and shared by every
-  connection.
+- The model needs about 2 GB of memory once it is loaded, and more while it reads a long prompt (see
+  [Performance](#performance)). It is loaded once per process and shared by every connection.
 
 ## Building
 
 ```bash
-git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decision-tune
-cd duckdb-decision-tune
+git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decide_onnx
+cd duckdb-decide_onnx
 git clone https://github.com/microsoft/vcpkg.git ../vcpkg && ../vcpkg/bootstrap-vcpkg.sh
 export VCPKG_TOOLCHAIN_PATH=$PWD/../vcpkg/scripts/buildsystems/vcpkg.cmake
 GEN=ninja make release
@@ -311,19 +327,15 @@ Tests that need the model are skipped unless you point them at a directory that 
 `model.onnx`. The extension's own cache directory works:
 
 ```bash
-DECISION_TUNE_MODEL_PATH=$HOME/.duckdb/decision_tune/1.0 make test
+DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v1 make test
 ```
 
-To regenerate the parity fixtures:
-
-```bash
-cd scripts/parity && uv run make_fixtures.py ~/.duckdb/decision_tune/1.0
-```
+To export the model again or regenerate the parity fixtures, see [scripts/export](scripts/export/README.md).
 
 ## Licences
 
 - This extension: MIT (see `LICENSE`).
-- DecisionTune 1.0 weights, ONNX graph and tokenizer: Apache-2.0, DecisionTune. The model card lists the
-  licences and known issues of the training data.
+- vela3-fast weights and tokenizer: Apache-2.0, vLLM Semantic Router and KR Labs. The ONNX graph on
+  assets.altertable.ai is an export of those weights, under the same licence, which is published next to it.
 - ONNX Runtime: MIT.
 - vcpkg overlay ports, adapted from [anofox_tabfm](https://github.com/DataZooDE/anofox-tabfm): MIT.

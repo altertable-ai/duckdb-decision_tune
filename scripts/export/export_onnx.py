@@ -1,0 +1,314 @@
+"""Export the vela3-fast decision backbone to ONNX for the decide_onnx DuckDB extension.
+
+vela3-fast (https://huggingface.co/vllm-sr/vela3-fast, Apache-2.0) answers choice and yes/no questions with its
+decision backbone: an UltraBERT-380M encoder and a small readout head (`vela3_encoder.DecisionEncoder`). One prompt
+is one question:
+
+    [BOS] [Q] question [O] option_1 [O] option_2 ... [SEP_SCHEMA] [SEG_user] state [EOS]
+
+The encoder and the readout become one ONNX graph, for one prompt at a time:
+
+    input_ids    int64 [1, T]   the prompt
+    positions    int64 [K]      the position of the [O] before each option
+    state_start  int64 [1]      the position of [SEG_user]
+    -> logits    float32 [K]    softmax over them gives the option probabilities
+
+The graph is not a trace of the published modeling code, which builds dense [T, T] attention masks and scores:
+O(T^2) memory, about 7 GB at 8K tokens on a CPU. `Encoder` below runs the same weights with memory linear in T:
+the 16 sliding-window layers attend in blocks of 128 queries, and the 8 global layers are ONNX Runtime's
+`com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash attention. Every export is checked against the
+unmodified `DecisionEncoder` (PyTorch, fp32) before it is written.
+
+Outputs land in `out/`: model.onnx, tokenizer.json, manifest.json and the weights' LICENSE. The extension's
+`src/include/decide_onnx/model_manifest.hpp` is regenerated.
+
+Usage: uv run python -I export_onnx.py [--out out]
+"""
+
+import argparse
+import hashlib
+import json
+import shutil
+import sys
+from pathlib import Path
+
+import numpy as np
+import onnx
+import onnxruntime as ort
+import onnxscript
+import torch
+import torch.nn.functional as F
+from huggingface_hub import snapshot_download
+
+# ONNX Runtime's contrib op, which `onnx` has no schema for: the part of its schema the export uses.
+_S = onnx.defs.OpSchema
+MULTI_HEAD_ATTENTION = onnxscript.values.Op(
+    onnxscript.values.Opset("com.microsoft", 1), "MultiHeadAttention",
+    _S("MultiHeadAttention", "com.microsoft", 1,
+       inputs=[_S.FormalParameter(name, "T") for name in ("query", "key", "value")],
+       outputs=[_S.FormalParameter("output", "T")],
+       type_constraints=[("T", ["tensor(float)"], "")],
+       attributes=[_S.Attribute("num_heads", _S.AttrType.INT, ""), _S.Attribute("scale", _S.AttrType.FLOAT, "")]))
+
+ASSET_VERSION = "v1"
+HF_REPO = "vllm-sr/vela3-fast"
+HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb"
+# Everything the decision backbone needs; the span and router adapters are not used.
+HF_FILES = ["*.py", "*.json", "model.safetensors", "LICENSE", "SHA256SUMS"]
+INPUT_NAMES = ["input_ids", "positions", "state_start"]
+OUTPUT_NAMES = ["logits"]
+BLOCK = 128
+# Prompt lengths checked against PyTorch: short, around one block, several blocks, and long.
+VERIFY_LENGTHS = [3, 40, 127, 128, 129, 300, 1100, 4000, 9000]
+VERIFY_TOLERANCE = 1e-3
+REPO_ROOT = Path(__file__).resolve().parents[2]
+HEADER_PATH = REPO_ROOT / "src" / "include" / "decide_onnx" / "model_manifest.hpp"
+
+
+def load_reference():
+    """The published `DecisionEncoder` (CPU, fp32) and the snapshot directory it was loaded from."""
+    path = Path(snapshot_download(HF_REPO, revision=HF_REVISION, allow_patterns=HF_FILES))
+    sys.path.insert(0, str(path))
+    from vela3_encoder import DecisionEncoder
+
+    return DecisionEncoder.load(path, device="cpu"), path
+
+
+def rotate_half(x):
+    half = x.shape[-1] // 2
+    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def rms_norm(norm, x):
+    return norm.weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon))
+
+
+@torch.library.custom_op("decide_onnx::global_attention", mutates_args=())
+def global_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, scale: float) -> torch.Tensor:
+    """Unmasked attention over [1, T, heads * dim] inputs; exported as com.microsoft.MultiHeadAttention."""
+    split = lambda x: x.reshape(1, x.shape[1], num_heads, -1).transpose(1, 2)
+    out = F.scaled_dot_product_attention(split(q), split(k), split(v), scale=scale)
+    return out.transpose(1, 2).reshape(q.shape)
+
+
+@global_attention.register_fake
+def _(q, k, v, num_heads, scale):
+    return torch.empty_like(q)
+
+
+def onnx_global_attention(q, k, v, num_heads: int, scale: float):
+    return MULTI_HEAD_ATTENTION(q, k, v, num_heads=num_heads, scale=scale)
+
+
+def local_attention(q, k, v, window, scale):
+    """Attention over the keys within `window` positions, in blocks of BLOCK queries: O(T * window) memory."""
+    heads, length, dim = q.shape[1], q.shape[2], q.shape[3]
+    count = (length + BLOCK - 1) // BLOCK
+    tail = count * BLOCK - length
+    span = BLOCK + 2 * window
+    starts = torch.arange(count) * BLOCK
+    key_index = starts[:, None] + torch.arange(span)[None, :]  # [count, span] into the padded keys
+    k_win = F.pad(k, (0, 0, window, tail + window))[:, :, key_index]  # [1, H, count, span, D]
+    v_win = F.pad(v, (0, 0, window, tail + window))[:, :, key_index]
+    q_blocks = F.pad(q, (0, 0, 0, tail)).reshape(1, heads, count, BLOCK, dim)
+    q_pos = starts[:, None, None] + torch.arange(BLOCK)[None, :, None]
+    k_pos = starts[:, None, None] - window + torch.arange(span)[None, None, :]
+    allowed = ((q_pos - k_pos).abs() <= window) & (k_pos >= 0) & (k_pos < length)
+    scores = torch.matmul(q_blocks, k_win.transpose(-1, -2)) * scale
+    scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+    out = torch.matmul(scores.softmax(-1), v_win)  # [1, H, count, BLOCK, D]
+    return out.reshape(1, heads, count * BLOCK, dim)[:, :, :length]
+
+
+class Encoder(torch.nn.Module):
+    """`DecisionEncoder`'s encoder and readout for one unpadded prompt, on the reference's own modules."""
+
+    def __init__(self, reference):
+        super().__init__()
+        self.reference = reference
+        self.config = reference.encoder.config
+        self.inv_freq = {theta: 1.0 / (theta ** (torch.arange(0, self.config.head_dim, 2, dtype=torch.float32)
+                                                 / self.config.head_dim))
+                         for theta in set(self.config.rope_theta)}
+
+    def forward(self, input_ids, positions, state_start):
+        encoder, cfg = self.reference.encoder, self.config
+        length = input_ids.shape[1]
+        h = encoder.embed_tokens(input_ids)
+        position = torch.arange(length, dtype=torch.float32)
+        rope = {}
+        for theta, inv_freq in self.inv_freq.items():
+            freqs = position[:, None] * inv_freq[None, :]
+            emb = torch.cat((freqs, freqs), dim=-1)
+            rope[theta] = (emb.cos()[None, None], emb.sin()[None, None])
+        for i, layer in enumerate(encoder.layers):
+            attn = layer.self_attn
+            x = rms_norm(layer.input_layernorm, h)
+            q = attn.q_proj(x).reshape(1, length, -1, cfg.head_dim).transpose(1, 2)
+            k = attn.k_proj(x).reshape(1, length, -1, cfg.head_dim).transpose(1, 2)
+            v = attn.v_proj(x).reshape(1, length, -1, cfg.head_dim).transpose(1, 2)
+            cos, sin = rope[cfg.rope_theta[i]]
+            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+            window = cfg.attention_windows[i]
+            if window is None:
+                flat = [x.transpose(1, 2).reshape(1, length, -1) for x in (q, k, v)]
+                out = global_attention(*flat, cfg.num_attention_heads, attn.scaling)
+            else:
+                out = local_attention(q, k, v, window, attn.scaling).transpose(1, 2).reshape(1, length, -1)
+            h = h + attn.o_proj(out)
+            x = rms_norm(layer.post_attention_layernorm, h)
+            h = h + layer.mlp(x)
+        hidden = rms_norm(encoder.norm, h)[0]  # [T, hidden]
+        return self.readout(hidden, positions, state_start)
+
+    def readout(self, hidden, positions, state_start):
+        """`DecisionEncoder._logits` for one prompt: the state is pooled from [SEG_user] up to [EOS]."""
+        ref = self.reference
+        end = hidden.shape[0] - 1
+        sums = F.pad(hidden.cumsum(0), (0, 0, 1, 0))
+        pooled = (sums[end] - sums[state_start[0]]) / (end - state_start[0]).clamp(min=1).to(hidden.dtype)
+        state = F.normalize(ref.w_p(ref.norm(pooled)), dim=-1)
+        question = ref.w_q(ref.norm(hidden[1]))
+        options = hidden[positions]
+        u = F.normalize(ref.w_o(ref.norm(options)) + question, dim=-1)
+        return (u * state).sum(-1) / ref.log_tau.exp() + ref.cls_mlp(options).squeeze(-1)
+
+
+def export_graph(reference, path: Path) -> None:
+    model = Encoder(reference).eval()
+    length = 300
+    example = (torch.randint(100, 40000, (1, length)), torch.tensor([2, 9, 17]), torch.tensor([30]))
+    with torch.inference_mode():
+        program = torch.onnx.export(
+            model,
+            example,
+            dynamo=True,
+            opset_version=20,
+            input_names=INPUT_NAMES,
+            output_names=OUTPUT_NAMES,
+            custom_translation_table={torch.ops.decide_onnx.global_attention.default: onnx_global_attention},
+            dynamic_shapes={
+                "input_ids": {1: torch.export.Dim("length", min=4, max=32768)},
+                "positions": {0: torch.export.Dim("options", min=1, max=4096)},
+                "state_start": None,
+            },
+        )
+    program.save(str(path))
+
+
+def verify_prompt(reference, length, options, seed):
+    """A random prompt of `length` tokens with the reference's layout, as `DecisionEncoder.encode` builds it."""
+    g = torch.Generator().manual_seed(seed)
+    mk = reference.mk
+    body = torch.randint(200, 49000, (length,), generator=g).tolist()
+    ids = [reference.tok.bos_token_id, mk["[Q]"]] + body[:2]
+    positions = []
+    for i in range(options):
+        positions.append(len(ids))
+        ids += [mk["[O]"]] + body[2 + i : 3 + i]
+    ids.append(mk["[SEP_SCHEMA]"])
+    state_start = len(ids)
+    ids += [mk["[SEG_user]"]] + body[3 + options :]
+    ids.append(reference.tok.eos_token_id)
+    return dict(ids=ids, q_pos=1, opt_pos=positions, names=[str(i) for i in range(options)], pool=(state_start, len(ids) - 1))
+
+
+def verify_graph(reference, path: Path) -> None:
+    """Compare ONNX Runtime with the unmodified `DecisionEncoder.forward_recs`; raise on mismatch."""
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    for n, length in enumerate(VERIFY_LENGTHS):
+        options = 2 + n % 4
+        rec = verify_prompt(reference, length, options, seed=n)
+        with torch.inference_mode():
+            H = reference.encoder(input_ids=torch.tensor([rec["ids"]]),
+                                  attention_mask=torch.ones(1, len(rec["ids"]), dtype=torch.long)).last_hidden_state
+            expected = reference._logits(H, [rec])[0].numpy()
+        logits = session.run(None, {"input_ids": np.array([rec["ids"]], np.int64),
+                                    "positions": np.array(rec["opt_pos"], np.int64),
+                                    "state_start": np.array([rec["pool"][0]], np.int64)})[0]
+        err = float(np.abs(logits - expected).max())
+        print(f"  verify T={len(rec['ids'])} options={options}: max abs logit err {err:.3e}")
+        if logits.shape != expected.shape or not err <= VERIFY_TOLERANCE:
+            raise SystemExit(f"verification failed for {path.name}: T={len(rec['ids'])}")
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_header(files: list[dict], markers: dict, context_tokens: int) -> None:
+    # Laid out exactly as clang-format (DuckDB's .clang-format) formats it, so `make format-check` passes.
+    by_name = {f["file_name"]: f for f in files}
+    tok, onnx = by_name["tokenizer.json"], by_name["model.onnx"]
+    marker_rows = "\n".join(f'static constexpr int64_t {name}_TOKEN = {markers[token]};'
+                            for name, token in [("QUESTION", "[Q]"), ("OPTION", "[O]"), ("SCHEMA_SEP", "[SEP_SCHEMA]"),
+                                                ("STATE", "[SEG_user]")])
+    HEADER_PATH.write_text(f"""// GENERATED by scripts/export/export_onnx.py; do not edit by hand.
+#pragma once
+
+#include <cstdint>
+
+namespace duckdb {{
+namespace decide_onnx {{
+
+//! A file of the model release, as listed in its `manifest.json`.
+struct ModelFile {{
+	//! Name in the local cache directory and under the download URL.
+	const char *file_name;
+	const char *sha256;
+	uint64_t file_bytes;
+}};
+
+static constexpr const char *MODEL_NAME = "vela3-fast";
+static constexpr const char *ASSET_VERSION = "{ASSET_VERSION}";
+//! The Hugging Face repository and commit the weights come from (Apache-2.0).
+static constexpr const char *HF_REPO = "{HF_REPO}";
+static constexpr const char *HF_REVISION = "{HF_REVISION}";
+
+static constexpr ModelFile TOKENIZER_FILE = {{
+    "tokenizer.json", "{tok["sha256"]}", {tok["file_bytes"]}ULL}};
+static constexpr ModelFile ONNX_FILE = {{
+    "model.onnx", "{onnx["sha256"]}", {onnx["file_bytes"]}ULL}};
+static constexpr const ModelFile *MODEL_FILES[] = {{&TOKENIZER_FILE, &ONNX_FILE}};
+
+//! The decision markers, appended to the tokenizer's vocabulary (`decision.marker_ids` in config.json).
+{marker_rows}
+
+//! `decision.max_len` in config.json: longer prompts are refused, never truncated.
+static constexpr uint64_t CONTEXT_TOKENS = {context_tokens};
+
+}} // namespace decide_onnx
+}} // namespace duckdb
+""")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "out")
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    print(f"exporting {HF_REPO}@{HF_REVISION}")
+    reference, snapshot = load_reference()
+    onnx_path = args.out / "model.onnx"
+    export_graph(reference, onnx_path)
+    verify_graph(reference, onnx_path)
+    shutil.copyfile(snapshot / "tokenizer.json", args.out / "tokenizer.json")
+    shutil.copyfile(snapshot / "LICENSE", args.out / "LICENSE")
+
+    decision = json.loads((snapshot / "config.json").read_text())["decision"]
+    files = [{"file_name": name, "sha256": sha256_of(args.out / name), "file_bytes": (args.out / name).stat().st_size}
+             for name in ("tokenizer.json", "model.onnx")]
+    manifest = {"asset_version": ASSET_VERSION, "hf_repo": HF_REPO, "hf_revision": HF_REVISION,
+                "marker_ids": decision["marker_ids"], "context_tokens": decision["max_len"], "files": files}
+    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    write_header(files, decision["marker_ids"], decision["max_len"])
+    print(f"wrote {args.out}")
+
+
+if __name__ == "__main__":
+    main()

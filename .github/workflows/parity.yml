@@ -1,7 +1,7 @@
 #
-# Builds the extension on Linux and checks the tokenizer and decision_choose against the Hugging Face tokenizer and
-# the Python ONNX Runtime (test/data/parity) using the published DecisionTune 1.0 files. The distribution pipeline
-# skips these tests because they need the model files.
+# Builds the extension on Linux and checks the tokenizer and the decision functions against the published vela3-fast
+# code (test/data/parity, from scripts/export/make_fixtures.py), using the ONNX export on assets.altertable.ai. The
+# distribution pipeline skips these tests because they need the model files.
 #
 name: Parity
 on:
@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   parity:
-    name: Parity with tokenizers + onnxruntime (DecisionTune 1.0)
+    name: Parity with the vela3-fast reference
     runs-on: ubuntu-latest
     env:
       VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
@@ -50,16 +50,15 @@ jobs:
       - name: Build
         run: make release
 
-      - name: Download DecisionTune 1.0
+      - name: Download vela3-fast (ONNX export)
         run: |
           mkdir -p models
-          base=https://huggingface.co/decision-tune/decisiontune-1.0/resolve/$(grep -o 'HF_REVISION = "[0-9a-f]*"' src/include/decision_tune/model_manifest.hpp | grep -o '[0-9a-f]\{40\}')
-          curl --fail --retry 3 -L -o models/tokenizer.json "$base/tokenizer.json"
-          curl --fail --retry 3 -L -o models/model.onnx "$base/onnx/model.onnx"
+          base=https://assets.altertable.ai/decide_onnx/$(grep -o 'ASSET_VERSION = "[^"]*"' src/include/decide_onnx/model_manifest.hpp | cut -d'"' -f2)
           for f in tokenizer.json model.onnx; do
-            expected=$(tr -d "\n" < src/include/decision_tune/model_manifest.hpp | grep -o "\"$f\", \"[^\"]*\",[[:space:]]*\"[0-9a-f]*\"" | grep -o '[0-9a-f]\{64\}')
+            curl --fail --retry 3 -L -o "models/$f" "$base/$f"
+            expected=$(grep -o "\"$f\", \"[0-9a-f]\{64\}\"" src/include/decide_onnx/model_manifest.hpp | grep -o '[0-9a-f]\{64\}')
             echo "${expected}  models/$f" | sha256sum --check
           done
 
       - name: Test
-        run: DECISION_TUNE_MODEL_PATH=$PWD/models make test
+        run: DECIDE_ONNX_MODEL_PATH=$PWD/models make test

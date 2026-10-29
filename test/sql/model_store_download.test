@@ -1,20 +1,20 @@
 # name: test/sql/model_store_download.test
-# description: downloading through decision_tune_model_url verifies the file and leaves no partial file
+# description: downloading through decide_onnx_model_url verifies the file and leaves no partial file
 # group: [sql]
 
-require decision_tune
+require decide_onnx
 
-require-env DECISION_TUNE_MODEL_PATH
+require-env DECIDE_ONNX_MODEL_PATH
 
 # A local directory works as the base URL too
 statement ok
-SET GLOBAL decision_tune_model_url = '{DECISION_TUNE_MODEL_PATH}';
+SET GLOBAL decide_onnx_model_url = '{DECIDE_ONNX_MODEL_PATH}';
 
 statement ok
-SET GLOBAL decision_tune_cache_dir = '{TEST_DIR}/download_cache';
+SET GLOBAL decide_onnx_cache_dir = '{TEST_DIR}/download_cache';
 
 query I
-SELECT cached FROM decision_tune_models() WHERE file_name = 'tokenizer.json';
+SELECT cached FROM decide_onnx_models() WHERE file_name = 'tokenizer.json';
 ----
 false
 
@@ -22,14 +22,14 @@ false
 concurrentloop connection 0 8
 
 query I
-SELECT decision_tune_tokenize('The order arrived broken.');
+SELECT decide_onnx_tokenize('The order arrived broken.');
 ----
-[510, 1340, 7244, 7154, 15]
+[504, 1686, 6612, 6792, 30]
 
 endloop
 
 query I
-SELECT cached FROM decision_tune_models() WHERE file_name = 'tokenizer.json';
+SELECT cached FROM decide_onnx_models() WHERE file_name = 'tokenizer.json';
 ----
 true
 

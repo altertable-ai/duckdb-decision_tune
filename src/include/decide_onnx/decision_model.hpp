@@ -1,7 +1,7 @@
 #pragma once
 
-#include "decision_tune/scorer.hpp"
-#include "decision_tune/tokenizer.hpp"
+#include "decide_onnx/scorer.hpp"
+#include "decide_onnx/tokenizer.hpp"
 
 #include "duckdb/common/list.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -11,24 +11,24 @@
 #include <vector>
 
 namespace duckdb {
-namespace decision_tune {
+namespace decide_onnx {
 
-//! The model input for one question: `[CLS] question [SEP] ([MASK] option)+ [SEP] state [SEP]`.
+//! The model input for one question:
+//! `<|endoftext|> [Q] question ([O] option)+ [SEP_SCHEMA] [SEG_user] state <|endoftext|>`.
 struct Prompt {
 	std::vector<int64_t> ids;
-	//! The position of the `[MASK]` before each option.
+	//! The position of the `[O]` before each option.
 	std::vector<int64_t> positions;
+	//! The position of `[SEG_user]`: the state is read from there up to the final `<|endoftext|>`.
+	int64_t state_start = 0;
 };
 
-//! `DecisionModel.encode` of the reference engine. Throws InvalidInputException when the prompt exceeds the
-//! context (the reference refuses it too, there is no truncation).
+//! `DecisionEncoder.encode` of the reference (vela3_encoder.py). Throws InvalidInputException when the prompt
+//! exceeds the context (the reference refuses it too, there is no truncation).
 Prompt EncodePrompt(const BpeTokenizer &tokenizer, const string &state, const string &question,
                     const vector<string> &options);
-//! The ids of `text` as it appears in a prompt: the reference replaces the special tokens `[MASK]`, `[CLS]`,
-//! `[SEP]`, `[PAD]` and `[UNK]` with spaces first.
-std::vector<int64_t> EncodeText(const BpeTokenizer &tokenizer, const string &text);
 
-//! DecisionTune 1.0: the tokenizer, the network and a memo of recent answers. Thread-safe.
+//! vela3-fast's decision backbone: the tokenizer, the network and a memo of recent answers. Thread-safe.
 class DecisionModel {
 public:
 	DecisionModel(shared_ptr<BpeTokenizer> tokenizer, shared_ptr<Scorer> scorer);
@@ -61,5 +61,5 @@ private:
 	unordered_map<CacheKey, CacheList::iterator, CacheKeyHash> cache_index;
 };
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb
