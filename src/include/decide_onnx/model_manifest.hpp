@@ -15,7 +15,7 @@ struct ModelFile {
 };
 
 static constexpr const char *MODEL_NAME = "vela3-fast";
-static constexpr const char *ASSET_VERSION = "v1";
+static constexpr const char *ASSET_VERSION = "v2";
 //! The Hugging Face repository and commit the weights come from (Apache-2.0).
 static constexpr const char *HF_REPO = "vllm-sr/vela3-fast";
 static constexpr const char *HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb";
@@ -23,7 +23,7 @@ static constexpr const char *HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aa
 static constexpr ModelFile TOKENIZER_FILE = {
     "tokenizer.json", "38734bb17ef19f84c67b5eb5692bea19801ffd02cb5c5ffc11429e76b0242e08", 3523470ULL};
 static constexpr ModelFile ONNX_FILE = {
-    "model.onnx", "17e1870c352dd5d59d671c8f63939d34d3a0186ab07b142f755129c83c473f70", 1523037842ULL};
+    "model.onnx", "504f42fa72c74f305001b262f7b43829b05bd1578e73609276d12f69ad9354c0", 1523543094ULL};
 static constexpr const ModelFile *MODEL_FILES[] = {&TOKENIZER_FILE, &ONNX_FILE};
 
 //! The decision markers, appended to the tokenizer's vocabulary (`decision.marker_ids` in config.json).

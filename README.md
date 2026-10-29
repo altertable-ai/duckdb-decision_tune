@@ -48,10 +48,10 @@ LOAD decide_onnx;
 query ends, and this includes the connection that runs `LOAD`. So send `LOAD decide_onnx` and the first `DECIDE`
 query as two separate statements, not as one string.
 
-The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v1/`.
+The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v2/`.
 That is `tokenizer.json` (3.5 MB) and `model.onnx` (1.52 GB), an ONNX export of the decision backbone of one pinned
 commit of the Hugging Face repository (see [scripts/export](scripts/export/README.md)). The extension checks each
-file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v1/`. The model loads when a
+file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v2/`. The model loads when a
 query first needs an answer, not when the query is bound, so `DESCRIBE` of a `DECIDE` query stays fast. The
 optimizer may compute a call whose arguments are all constants while it plans the query.
 
@@ -174,10 +174,10 @@ tokens and one yes/no question each:
 
 | Threads | Decisions per second |
 |---|---|
-| 1 | 15 (about 65 ms each) |
-| 4 | 37 |
-| 8 | 47 |
-| 14 | 50 |
+| 1 | 20 (about 50 ms each) |
+| 4 | 46 |
+| 8 | 48 |
+| 14 | 47 |
 
 Throughput stops growing after a few threads because memory bandwidth limits it, not compute. The ONNX graph
 scores one prompt per pass, and each pass reads all 1.5 GB of float32 weights. 10,000 rows with two questions
@@ -187,10 +187,10 @@ Long prompts cost much more, because 8 of the 24 layers attend over the whole pr
 
 | Prompt tokens | Time | Peak memory of the process |
 |---|---|---|
-| 2,000 | 3.4 s | 2.3 GB |
-| 8,000 | 28 s | 3.5 GB |
-| 16,000 | 99 s | 4.7 GB |
-| 32,000 | 6.3 min | 7.2 GB |
+| 2,000 | 3.8 s | 2.3 GB |
+| 8,000 | 29 s | 3.2 GB |
+| 16,000 | 104 s | 3.9 GB |
+| 32,000 | 6.5 min | 6.4 GB |
 
 DuckDB only computes the decisions that a query uses. `SELECT count(*) FROM t DECIDE (...)` does not run the
 model, and neither does a column that you do not select.
@@ -208,7 +208,7 @@ HTTP. The figures below are as published in October 2026. Only the vela3-fast th
 | Runs | In DuckDB, on your CPU | Hosted API | Hosted API (`gpt-6-luna`) |
 | Weights | Open, Apache-2.0, 380M parameters | Closed | Closed |
 | Price | No per-call cost | $0.042 per million input tokens, output free[^typesafe] | $0.10 per million input tokens, output free[^openai] |
-| Speed | About 65 ms per decision on one core; 15 to 50 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
+| Speed | About 50 ms per decision on one core; 20 to 48 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
 | Decision Index | 50.36 public index, 29.27 full score (board 0.4.1)[^card] | 57.89 (kit 0.2.1)[^kit] | Not published |
 | Context | 32,768 tokens | 262,144 tokens[^openrouter] | Not published |
 | Your data | Stays on your machine | Sent to TypeSafe | Sent to OpenAI |
@@ -243,8 +243,8 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v1'` | The URL the files are downloaded from. A local directory also works. |
-| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v1'` | Where the downloaded files are cached. |
+| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v2'` | The URL the files are downloaded from. A local directory also works. |
+| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v2'` | Where the downloaded files are cached. |
 | `decide_onnx_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`. The files are not checksummed. |
 
 ### Offline use
@@ -276,8 +276,10 @@ To use the extension on a machine without internet access, do one of these:
   MLP). A softmax over them gives the probabilities. A yes/no question is the choice between `no` and `yes`. The
   result has no calibration temperature, no option filtering and no truncation.
 - **Graph.** `scripts/export/export_onnx.py` exports the decision backbone and checks it against the published
-  PyTorch code. It keeps memory linear in the prompt length: the sliding-window layers attend in blocks, and the
-  global layers use ONNX Runtime's flash attention (`com.microsoft.MultiHeadAttention`).
+  PyTorch code. It keeps memory linear in the prompt length and uses ONNX Runtime's fused kernels: flash attention
+  (`com.microsoft.MultiHeadAttention`) for the global layers and for short prompts, blocked attention for the
+  sliding-window layers, `RotaryEmbedding` and `SimplifiedLayerNormalization`. See
+  [scripts/export](scripts/export/README.md).
 - **Syntax.** `DECIDE` and the `AMONG` / `GIVEN` call forms are additions to DuckDB's PEG grammar. They are
   registered as the `decide_onnx` grammar extension (`src/decide_grammar.cpp`). They only add rules and choices
   and replace no stock rule, so they combine with other grammar extensions (such as
@@ -327,7 +329,7 @@ Tests that need the model are skipped unless you point them at a directory that 
 `model.onnx`. The extension's own cache directory works:
 
 ```bash
-DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v1 make test
+DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v2 make test
 ```
 
 To export the model again or regenerate the parity fixtures, see [scripts/export](scripts/export/README.md).

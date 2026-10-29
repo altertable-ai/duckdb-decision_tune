@@ -20,13 +20,25 @@ and the model's Python files); the span and router adapters are not needed.
 `DecisionEncoder` of `vela3_encoder.py` (the UltraBERT-380M encoder and its cosine + MLP readout) becomes one
 graph for one prompt at a time. Its inputs and outputs are documented at the top of `export_onnx.py`. The graph
 runs the published weights, but not the published forward code. That code builds dense `[T, T]` attention masks,
-which needs about 7 GB at 8K tokens on a CPU. The export keeps memory linear in the prompt length instead:
-- The 16 sliding-window layers attend in blocks of 128 queries.
-- The 8 global layers use ONNX Runtime's `com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash
-  attention. The extension's ONNX Runtime build includes the contrib ops.
+which needs about 7 GB at 8K tokens on a CPU. The export keeps memory linear in the prompt length instead, and
+maps each part of the network onto an ONNX Runtime kernel:
+- The 8 global layers use `com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash attention.
+- The 16 sliding-window layers attend in blocks of 128 queries. Each block's keys are three slices of the padded
+  keys, not a gather. A prompt of at most 129 tokens fits in one window, so an `If` sends it to
+  `MultiHeadAttention` instead, which is exact and cheaper.
+- RoPE uses `com.microsoft.RotaryEmbedding`, so q, k and v stay `[1, T, hidden]` and the global layers need no
+  transposes.
+- RMSNorm is written as `x / sqrt(mean(x^2) + eps)`, which ONNX Runtime fuses into
+  `SimplifiedLayerNormalization`. It also fuses SiLU into `QuickGelu`.
 
-Before anything is written, each export is checked against the unmodified PyTorch `DecisionEncoder` on 9 prompts
-of 10 to 9,006 tokens. A run fails if a logit is off by more than 1e-3. The observed worst case is about 1.3e-5.
+The extension's ONNX Runtime build includes the contrib ops, and KleidiAI on arm64 for the matmuls. Compared with
+a plain export, these choices cut a 30-token pass from about 61 ms to 33 ms on one Apple M4 Pro core
+(`Transpose` alone was 21% of it). A short pass is now about 80% `MatMul`, which reads the 1.5 GB of fp32 weights;
+a long one is mostly `MultiHeadAttention` and `MatMul`.
+
+Before anything is written, each export is checked against the unmodified PyTorch `DecisionEncoder` on 10 prompts
+of 10 to 9,006 tokens, including 129 and 130 tokens on both sides of the `If`. A run fails if a logit is off by
+more than 1e-3. The observed worst case is about 1e-5.
 
 The prompt rendering (`ub_d3_common.to_row` and `DecisionEncoder.encode`) is ported to C++ in
 `src/decision_model.cpp` and `src/state_text.cpp`. The fixtures come from the reference's own

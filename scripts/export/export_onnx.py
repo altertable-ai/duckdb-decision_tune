@@ -14,10 +14,14 @@ The encoder and the readout become one ONNX graph, for one prompt at a time:
     -> logits    float32 [K]    softmax over them gives the option probabilities
 
 The graph is not a trace of the published modeling code, which builds dense [T, T] attention masks and scores:
-O(T^2) memory, about 7 GB at 8K tokens on a CPU. `Encoder` below runs the same weights with memory linear in T:
-the 16 sliding-window layers attend in blocks of 128 queries, and the 8 global layers are ONNX Runtime's
-`com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash attention. Every export is checked against the
-unmodified `DecisionEncoder` (PyTorch, fp32) before it is written.
+O(T^2) memory, about 7 GB at 8K tokens on a CPU. `Encoder` below runs the same weights on ONNX Runtime's own
+kernels, with memory linear in T:
+- the 8 global layers are `com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash attention;
+- the 16 sliding-window layers attend in blocks of 128 queries, built from slices of the padded keys; a prompt of
+  at most 129 tokens fits in one window, so an `If` sends it to MultiHeadAttention instead;
+- RoPE is `com.microsoft.RotaryEmbedding`, so q, k and v stay [1, T, hidden] with no transposes in global layers;
+- RMSNorm is written so that ONNX Runtime fuses it into `SimplifiedLayerNormalization`.
+Every export is checked against the unmodified `DecisionEncoder` (PyTorch, fp32) before it is written.
 
 Outputs land in `out/`: model.onnx, tokenizer.json, manifest.json and the weights' LICENSE. The extension's
 `src/include/decide_onnx/model_manifest.hpp` is regenerated.
@@ -40,17 +44,27 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 
-# ONNX Runtime's contrib op, which `onnx` has no schema for: the part of its schema the export uses.
 _S = onnx.defs.OpSchema
-MULTI_HEAD_ATTENTION = onnxscript.values.Op(
-    onnxscript.values.Opset("com.microsoft", 1), "MultiHeadAttention",
-    _S("MultiHeadAttention", "com.microsoft", 1,
-       inputs=[_S.FormalParameter(name, "T") for name in ("query", "key", "value")],
-       outputs=[_S.FormalParameter("output", "T")],
-       type_constraints=[("T", ["tensor(float)"], "")],
-       attributes=[_S.Attribute("num_heads", _S.AttrType.INT, ""), _S.Attribute("scale", _S.AttrType.FLOAT, "")]))
 
-ASSET_VERSION = "v1"
+
+def contrib_op(name, inputs, attributes):
+    """An ONNX Runtime contrib op, which `onnx` has no schema for: the part of its schema the export uses.
+    `inputs` maps each input to its type ("T": float, "M": int64)."""
+    schema = _S(name, "com.microsoft", 1,
+                inputs=[_S.FormalParameter(n, t) for n, t in inputs.items()],
+                outputs=[_S.FormalParameter("output", "T")],
+                type_constraints=[("T", ["tensor(float)"], ""), ("M", ["tensor(int64)"], "")],
+                attributes=[_S.Attribute(n, t, "") for n, t in attributes.items()])
+    return onnxscript.values.Op(onnxscript.values.Opset("com.microsoft", 1), name, schema)
+
+
+MULTI_HEAD_ATTENTION = contrib_op("MultiHeadAttention", {"query": "T", "key": "T", "value": "T"},
+                                  {"num_heads": _S.AttrType.INT, "scale": _S.AttrType.FLOAT})
+ROTARY_EMBEDDING = contrib_op("RotaryEmbedding",
+                              {"input": "T", "position_ids": "M", "cos_cache": "T", "sin_cache": "T"},
+                              {"num_heads": _S.AttrType.INT})
+
+ASSET_VERSION = "v2"
 HF_REPO = "vllm-sr/vela3-fast"
 HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb"
 # Everything the decision backbone needs; the span and router adapters are not used.
@@ -58,8 +72,9 @@ HF_FILES = ["*.py", "*.json", "model.safetensors", "LICENSE", "SHA256SUMS"]
 INPUT_NAMES = ["input_ids", "positions", "state_start"]
 OUTPUT_NAMES = ["logits"]
 BLOCK = 128
-# Prompt lengths checked against PyTorch: short, around one block, several blocks, and long.
-VERIFY_LENGTHS = [3, 40, 127, 128, 129, 300, 1100, 4000, 9000]
+# (body tokens, options) checked against PyTorch; a prompt is body + options + 4 tokens. Short, both sides of the
+# 129-token switch from global to blocked attention in the sliding-window layers, several blocks, and long.
+VERIFY_CASES = [(3, 2), (40, 3), (123, 2), (124, 2), (125, 4), (127, 5), (300, 3), (1100, 4), (4000, 5), (9000, 2)]
 VERIFY_TOLERANCE = 1e-3
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HEADER_PATH = REPO_ROOT / "src" / "include" / "decide_onnx" / "model_manifest.hpp"
@@ -74,13 +89,29 @@ def load_reference():
     return DecisionEncoder.load(path, device="cpu"), path
 
 
-def rotate_half(x):
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
 def rms_norm(norm, x):
-    return norm.weight * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon))
+    # Written as x / sqrt(...) so that ONNX Runtime fuses it into SimplifiedLayerNormalization.
+    return norm.weight * (x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon))
+
+
+@torch.library.custom_op("decide_onnx::rotary_embedding", mutates_args=())
+def rotary_embedding(x: torch.Tensor, position_ids: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                     num_heads: int) -> torch.Tensor:
+    """RoPE with rotate_half on [1, T, heads * dim]; cos and sin are [T, dim / 2]. Exported as
+    com.microsoft.RotaryEmbedding (non-interleaved)."""
+    heads = x.reshape(1, x.shape[1], num_heads, -1)
+    c, s = cos[position_ids][:, :, None, :], sin[position_ids][:, :, None, :]
+    x1, x2 = heads.chunk(2, dim=-1)
+    return torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1).reshape(x.shape)
+
+
+@rotary_embedding.register_fake
+def _(x, position_ids, cos, sin, num_heads):
+    return torch.empty_like(x)
+
+
+def onnx_rotary_embedding(x, position_ids, cos, sin, num_heads: int):
+    return ROTARY_EMBEDDING(x, position_ids, cos, sin, num_heads=num_heads)
 
 
 @torch.library.custom_op("decide_onnx::global_attention", mutates_args=())
@@ -101,15 +132,20 @@ def onnx_global_attention(q, k, v, num_heads: int, scale: float):
 
 
 def local_attention(q, k, v, window, scale):
-    """Attention over the keys within `window` positions, in blocks of BLOCK queries: O(T * window) memory."""
+    """Attention over the keys within `window` positions, in blocks of BLOCK queries: O(T * window) memory.
+    With window == BLOCK, the keys of block i are the padded blocks i, i + 1 and i + 2: slices, not a gather."""
+    assert window == BLOCK, "the sliding window must be one block"
     heads, length, dim = q.shape[1], q.shape[2], q.shape[3]
     count = (length + BLOCK - 1) // BLOCK
     tail = count * BLOCK - length
     span = BLOCK + 2 * window
     starts = torch.arange(count) * BLOCK
-    key_index = starts[:, None] + torch.arange(span)[None, :]  # [count, span] into the padded keys
-    k_win = F.pad(k, (0, 0, window, tail + window))[:, :, key_index]  # [1, H, count, span, D]
-    v_win = F.pad(v, (0, 0, window, tail + window))[:, :, key_index]
+
+    def windows(x):  # [1, H, count, span, D]
+        blocks = F.pad(x, (0, 0, window, tail + window)).reshape(1, heads, count + 2, BLOCK, dim)
+        return torch.cat((blocks[:, :, :count], blocks[:, :, 1:count + 1], blocks[:, :, 2:]), dim=3)
+
+    k_win, v_win = windows(k), windows(v)
     q_blocks = F.pad(q, (0, 0, 0, tail)).reshape(1, heads, count, BLOCK, dim)
     q_pos = starts[:, None, None] + torch.arange(BLOCK)[None, :, None]
     k_pos = starts[:, None, None] - window + torch.arange(span)[None, None, :]
@@ -118,6 +154,13 @@ def local_attention(q, k, v, window, scale):
     scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
     out = torch.matmul(scores.softmax(-1), v_win)  # [1, H, count, BLOCK, D]
     return out.reshape(1, heads, count * BLOCK, dim)[:, :, :length]
+
+
+def blocked_attention(q, k, v, heads, window, scale):
+    """`local_attention` on [1, T, heads * dim] inputs and output."""
+    length = q.shape[1]
+    q, k, v = (t.reshape(1, length, heads, -1).transpose(1, 2) for t in (q, k, v))
+    return local_attention(q, k, v, window, scale).transpose(1, 2).reshape(1, length, -1)
 
 
 class Encoder(torch.nn.Module):
@@ -135,26 +178,29 @@ class Encoder(torch.nn.Module):
         encoder, cfg = self.reference.encoder, self.config
         length = input_ids.shape[1]
         h = encoder.embed_tokens(input_ids)
-        position = torch.arange(length, dtype=torch.float32)
+        position_ids = torch.arange(length)[None]
         rope = {}
         for theta, inv_freq in self.inv_freq.items():
-            freqs = position[:, None] * inv_freq[None, :]
-            emb = torch.cat((freqs, freqs), dim=-1)
-            rope[theta] = (emb.cos()[None, None], emb.sin()[None, None])
+            freqs = torch.arange(length, dtype=torch.float32)[:, None] * inv_freq[None, :]
+            rope[theta] = (freqs.cos(), freqs.sin())
+        heads = cfg.num_attention_heads
         for i, layer in enumerate(encoder.layers):
             attn = layer.self_attn
             x = rms_norm(layer.input_layernorm, h)
-            q = attn.q_proj(x).reshape(1, length, -1, cfg.head_dim).transpose(1, 2)
-            k = attn.k_proj(x).reshape(1, length, -1, cfg.head_dim).transpose(1, 2)
-            v = attn.v_proj(x).reshape(1, length, -1, cfg.head_dim).transpose(1, 2)
             cos, sin = rope[cfg.rope_theta[i]]
-            q, k = q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+            # q, k and v stay [1, T, heads * dim]: what RotaryEmbedding and MultiHeadAttention take.
+            q = rotary_embedding(attn.q_proj(x), position_ids, cos, sin, heads)
+            k = rotary_embedding(attn.k_proj(x), position_ids, cos, sin, heads)
+            v = attn.v_proj(x)
             window = cfg.attention_windows[i]
             if window is None:
-                flat = [x.transpose(1, 2).reshape(1, length, -1) for x in (q, k, v)]
-                out = global_attention(*flat, cfg.num_attention_heads, attn.scaling)
+                out = global_attention(q, k, v, heads, attn.scaling)
             else:
-                out = local_attention(q, k, v, window, attn.scaling).transpose(1, 2).reshape(1, length, -1)
+                # A prompt of at most window + 1 tokens attends everywhere: the global kernel is exact and cheaper.
+                out = torch.cond(length <= window + 1,
+                                 lambda q, k, v: global_attention(q, k, v, heads, attn.scaling),
+                                 lambda q, k, v: blocked_attention(q, k, v, heads, window, attn.scaling),
+                                 (q, k, v))
             h = h + attn.o_proj(out)
             x = rms_norm(layer.post_attention_layernorm, h)
             h = h + layer.mlp(x)
@@ -186,7 +232,8 @@ def export_graph(reference, path: Path) -> None:
             opset_version=20,
             input_names=INPUT_NAMES,
             output_names=OUTPUT_NAMES,
-            custom_translation_table={torch.ops.decide_onnx.global_attention.default: onnx_global_attention},
+            custom_translation_table={torch.ops.decide_onnx.global_attention.default: onnx_global_attention,
+                                      torch.ops.decide_onnx.rotary_embedding.default: onnx_rotary_embedding},
             dynamic_shapes={
                 "input_ids": {1: torch.export.Dim("length", min=4, max=32768)},
                 "positions": {0: torch.export.Dim("options", min=1, max=4096)},
@@ -216,8 +263,7 @@ def verify_prompt(reference, length, options, seed):
 def verify_graph(reference, path: Path) -> None:
     """Compare ONNX Runtime with the unmodified `DecisionEncoder.forward_recs`; raise on mismatch."""
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    for n, length in enumerate(VERIFY_LENGTHS):
-        options = 2 + n % 4
+    for n, (length, options) in enumerate(VERIFY_CASES):
         rec = verify_prompt(reference, length, options, seed=n)
         with torch.inference_mode():
             H = reference.encoder(input_ids=torch.tensor([rec["ids"]]),
