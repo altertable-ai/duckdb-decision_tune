@@ -1,4 +1,4 @@
-#include "decision_tune/decide_grammar.hpp"
+#include "decide_onnx/decide_grammar.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -25,7 +25,7 @@
 #include "duckdb/planner/extension_callback.hpp"
 
 namespace duckdb {
-namespace decision_tune {
+namespace decide_onnx {
 
 //===--------------------------------------------------------------------===//
 // Grammar
@@ -201,7 +201,7 @@ static DecideQuestionSpec TransformQuestion(PEGTransformer &transformer, ParseRe
 	} else if (StringUtil::CIEquals(kind.Name(), "DecideChoose")) {
 		spec.options = TransformAmong(transformer, kind_pr.GetChild(2));
 	} else {
-		throw InternalException("decision_tune: unexpected DECIDE question rule '%s'", kind.Name());
+		throw InternalException("decide_onnx: unexpected DECIDE question rule '%s'", kind.Name());
 	}
 	// The name is optional in the grammar only to give a clearer error than a syntax error.
 	auto alias = OptionalChild(list_pr, 1);
@@ -260,7 +260,7 @@ static unique_ptr<ParsedExpression> Function(const string &name, ARGS... args) {
 	return Function(name, std::move(children));
 }
 
-//! The state: the single input itself, or struct_pack(name := input, ...) read as "name: value | ...".
+//! The state: the single input itself, or struct_pack(name := input, ...) read as a compact JSON object.
 static unique_ptr<ParsedExpression> StateExpression(const vector<DecideInputSpec> &inputs) {
 	if (inputs.size() == 1) {
 		return inputs[0].expression->Copy();
@@ -415,7 +415,7 @@ static bool IsFunctionExpressionReference(const PEGExpression &expression) {
 
 class DecideGrammarExtension final : public GrammarExtension {
 public:
-	static constexpr const char *NAME = "decision_tune";
+	static constexpr const char *NAME = "decide_onnx";
 
 	DecideGrammarExtension()
 	    : GrammarExtension(NAME, "DECIDE clause, decision_choose(question AMONG (...) GIVEN ...) and "
@@ -489,7 +489,7 @@ private:
 //! next query ends, since another thread may be parsing with their grammar right now.
 class PendingDecideGrammarActivation final : public ClientContextState {
 public:
-	static constexpr const char *KEY = "decision_tune_pending_grammar_activation";
+	static constexpr const char *KEY = "decide_onnx_pending_grammar_activation";
 
 	explicit PendingDecideGrammarActivation(shared_ptr<DecideGrammarExtension> grammar_p)
 	    : grammar(std::move(grammar_p)) {
@@ -515,5 +515,5 @@ void RegisterDecideGrammar(DatabaseInstance &db) {
 	}
 }
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

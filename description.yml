@@ -1,8 +1,8 @@
-# Draft for the duckdb/community-extensions repository (extensions/decision_tune/description.yml).
+# Draft for the duckdb/community-extensions repository (extensions/decide_onnx/description.yml).
 # Fill in maintainers and repo.ref (the release commit) before submitting.
 extension:
-  name: decision_tune
-  description: Classify rows, route messages and answer yes/no questions in SQL with the DecisionTune 1.0 model, on CPU via ONNX Runtime
+  name: decide_onnx
+  description: Classify rows, route messages and answer yes/no questions in SQL with the vela3-fast decision model, on CPU via ONNX Runtime
   version: '0.1.0'
   language: C++
   build: cmake
@@ -12,12 +12,12 @@ extension:
   excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;linux_amd64_musl"
 
 repo:
-  github: altertable-ai/duckdb-decision-tune
+  github: altertable-ai/duckdb-decide_onnx
   ref: TODO-release-commit
 
 docs:
   hello_world: |
-    -- DecisionTune 1.0 (1.6 GB) is downloaded from Hugging Face and cached on first use.
+    -- vela3-fast (1.5 GB, an ONNX export) is downloaded from assets.altertable.ai and cached on first use.
     CREATE TABLE tickets AS FROM (VALUES
         ('Broken mug', 'The order arrived broken. I want my money back.'),
         ('Double charge', 'I was charged twice this month.')
@@ -39,8 +39,8 @@ docs:
     FROM tickets;
 
   extended_description: |
-    **decision_tune** runs [DecisionTune 1.0](https://decisiontune.com/), a 395M-parameter decision model, inside
-    DuckDB. You give it a state, a question and options; it picks an option and gives a probability for each, or
+    **decide_onnx** runs the decision backbone of [vela3-fast](https://huggingface.co/vllm-sr/vela3-fast), a
+    380M-parameter encoder of the vLLM Semantic Router Vela 3.0 family, inside DuckDB. You give it a state, a question and options; it picks an option and gives a probability for each, or
     gives P(yes) for a yes/no question, in one encoder pass. There is no prompt engineering of an LLM, no Python
     and no GPU: the network runs on CPU through a statically linked ONNX Runtime.
 
@@ -51,12 +51,12 @@ docs:
       probability; options are a list of texts, or a MAP or STRUCT of key to description.
       `decision_yes_no(state, question)` returns P(yes). Both also take the clause's words:
       `decision_choose('Which team?' AMONG (billing, tech) GIVEN subject, message)`.
-    - A STRUCT, MAP or JSON object state is read as `key: value | ...`, the way the reference engine reads a dict.
-    - `decision_tune_models()` lists the model files and whether they are cached. Set `decision_tune_model_path`
+    - A STRUCT, MAP or JSON state is read as compact JSON, the way the reference reads a JSON state.
+    - `decide_onnx_models()` lists the model files and whether they are cached. Set `decide_onnx_model_path`
       to use a local copy offline.
 
     The tokenizer is a C++ port of the Hugging Face one and matches it token for token; the probabilities match
-    onnxruntime in Python to 1e-4. Rows run in parallel on DuckDB's threads and repeated decisions are scored once.
+    the published PyTorch code to 1e-4. Rows run in parallel on DuckDB's threads and repeated decisions are scored once.
 
-    The extension is MIT licensed. The DecisionTune 1.0 weights are Apache-2.0. The model's probabilities are not
+    The extension is MIT licensed. The vela3-fast weights are Apache-2.0. The model's probabilities are not
     calibrated; do not use it for high-risk decisions about people without independent validation.
