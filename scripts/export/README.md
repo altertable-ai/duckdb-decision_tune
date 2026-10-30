@@ -36,9 +36,22 @@ a plain export, these choices cut a 30-token pass from about 61 ms to 33 ms on o
 (`Transpose` alone was 21% of it). A short pass is now about 80% `MatMul`, which reads the 1.5 GB of fp32 weights;
 a long one is mostly `MultiHeadAttention` and `MatMul`.
 
-Before anything is written, each export is checked against the unmodified PyTorch `DecisionEncoder` on 10 prompts
-of 10 to 9,006 tokens, including 129 and 130 tokens on both sides of the `If`. A run fails if a logit is off by
-more than 1e-3. The observed worst case is about 1e-5.
+## Weight storage
+
+The released `model.onnx` is the fp32 graph with its weights stored compactly, 452 MB instead of 1.52 GB:
+- the 168 encoder projections as int8, symmetric, in blocks of 128 input rows, read back by a blocked
+  `DequantizeLinear`, with the scales of ONNX Runtime's 8-bit `MatMulNBits` quantizer;
+- the token embedding as fp16, read back by a `Cast` (an int8 embedding doubled the error);
+- the readout head and the small tensors as fp32.
+
+The extension creates its session with `session.disable_quant_qdq = 1`, so ONNX Runtime constant-folds these weights
+back into fp32 when it loads the model and runs the same kernels as the fp32 graph, at the same speed. Without that
+option it would fuse them into `MatMulNBits`, which multiplies int8 weights directly: less memory, but up to 8 times
+slower on one core. The fp32 graph is kept as `out/model_fp32.onnx`.
+
+Each export is checked against the unmodified PyTorch `DecisionEncoder` on 10 prompts of 10 to 9,006 tokens,
+including 129 and 130 tokens on both sides of the `If`. A run fails if a logit of the fp32 graph is off by more than
+1e-3 (the observed worst case is about 1e-5), or a logit of the released graph by more than 0.1 (about 0.04).
 
 The prompt rendering (`ub_d3_common.to_row` and `DecisionEncoder.encode`) is ported to C++ in
 `src/decision_model.cpp` and `src/state_text.cpp`. The fixtures come from the reference's own
@@ -48,13 +61,14 @@ The prompt rendering (`ub_d3_common.to_row` and `DecisionEncoder.encode`) is por
 
 Re-exporting does not give byte-identical files. Two runs produced different SHA-256s for `model.onnx`, though
 both verify the same way. So the committed `model_manifest.hpp` and the uploaded files must come from the same
-run: the extension refuses files whose SHA-256 differs from the header.
+run: the extension refuses files whose SHA-256 differs from the header. The weight storage step is deterministic:
+`export_onnx.py --skip-export` rebuilds the release from the `out/model_fp32.onnx` of an earlier run.
 
 ## Publishing a new asset version
 
 1. Bump `ASSET_VERSION` in `export_onnx.py` if the graph changes, along with the default
    `decide_onnx_model_url` and `decide_onnx_cache_dir` in `src/model_store.cpp`.
 2. Run both scripts and commit the regenerated header and fixtures.
-3. Upload everything in `out/` to `https://assets.altertable.ai/decide_onnx/<ASSET_VERSION>/`: `model.onnx`,
-   `tokenizer.json`, `manifest.json` and the weights' `LICENSE`. The weights are Apache-2.0, and the licence must
+3. Upload the release in `out/` to `https://assets.altertable.ai/decide_onnx/<ASSET_VERSION>/`: `model.onnx`,
+   `tokenizer.json`, `manifest.json` and the weights' `LICENSE` (not `model_fp32.onnx`). The weights are Apache-2.0, and the licence must
    stay next to them.

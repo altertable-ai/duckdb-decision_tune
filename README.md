@@ -48,10 +48,11 @@ LOAD decide_onnx;
 query ends, and this includes the connection that runs `LOAD`. So send `LOAD decide_onnx` and the first `DECIDE`
 query as two separate statements, not as one string.
 
-The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v2/`.
-That is `tokenizer.json` (3.5 MB) and `model.onnx` (1.52 GB), an ONNX export of the decision backbone of one pinned
-commit of the Hugging Face repository (see [scripts/export](scripts/export/README.md)). The extension checks each
-file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v2/`. The model loads when a
+The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v3/`.
+That is `tokenizer.json` (3.5 MB) and `model.onnx` (452 MB), an ONNX export of the decision backbone of one pinned
+commit of the Hugging Face repository (see [scripts/export](scripts/export/README.md)). The file stores the weights
+as int8 and fp16; ONNX Runtime turns them back into float32 when the model loads. The extension checks each
+file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v3/`. The model loads when a
 query first needs an answer, not when the query is bound, so `DESCRIBE` of a `DECIDE` query stays fast. The
 optimizer may compute a call whose arguments are all constants while it plans the query.
 
@@ -245,8 +246,8 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v2'` | The URL the files are downloaded from. A local directory also works. |
-| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v2'` | Where the downloaded files are cached. |
+| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v3'` | The URL the files are downloaded from. A local directory also works. |
+| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v3'` | Where the downloaded files are cached. |
 | `decide_onnx_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`. The files are not checksummed. |
 
 ### Offline use
@@ -292,8 +293,9 @@ The parity tests in `test/sql/parity_*.test` compare the extension with the publ
 PyTorch on the CPU (`scripts/export/make_fixtures.py`):
 - Token ids match exactly on 394 cases. The cases cover multilingual text, emoji, combining marks, runs of spaces,
   contractions and special tokens.
-- Probabilities match to within 1e-4 on 14 decisions: choices with and without descriptions, yes/no questions, and
-  text and JSON states.
+- Probabilities match to within 0.02 on 14 decisions: choices with and without descriptions, yes/no questions, and
+  text and JSON states. The largest difference is about 0.007, from the int8 storage of the weights; the same
+  answer is chosen in every case.
 
 ## Limitations
 
@@ -331,7 +333,7 @@ Tests that need the model are skipped unless you point them at a directory that 
 `model.onnx`. The extension's own cache directory works:
 
 ```bash
-DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v2 make test
+DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v3 make test
 ```
 
 To export the model again or regenerate the parity fixtures, see [scripts/export](scripts/export/README.md).

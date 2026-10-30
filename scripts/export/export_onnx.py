@@ -21,12 +21,18 @@ kernels, with memory linear in T:
   at most 129 tokens fits in one window, so an `If` sends it to MultiHeadAttention instead;
 - RoPE is `com.microsoft.RotaryEmbedding`, so q, k and v stay [1, T, hidden] with no transposes in global layers;
 - RMSNorm is written so that ONNX Runtime fuses it into `SimplifiedLayerNormalization`.
-Every export is checked against the unmodified `DecisionEncoder` (PyTorch, fp32) before it is written.
 
-Outputs land in `out/`: model.onnx, tokenizer.json, manifest.json and the weights' LICENSE. The extension's
-`src/include/decide_onnx/model_manifest.hpp` is regenerated.
+The released graph stores the weights compactly: the encoder projections as int8 (`DequantizeLinear`, blocks of 128)
+and the token embedding as fp16. With `session.disable_quant_qdq = 1`, ONNX Runtime folds them back into fp32 weights
+when it loads the model, so inference runs the fp32 kernels from a file a third of the size. Both the fp32 graph and
+the released one are checked against the unmodified `DecisionEncoder` (PyTorch, fp32).
 
-Usage: uv run python -I export_onnx.py [--out out]
+Outputs land in `out/`: model_fp32.onnx, and the release: model.onnx, tokenizer.json, manifest.json and the weights'
+LICENSE. The extension's `src/include/decide_onnx/model_manifest.hpp` is regenerated.
+
+Usage: uv run python -I export_onnx.py [--out out] [--skip-export]
+  --skip-export   reuse out/model_fp32.onnx (verified again) instead of exporting it anew; exports are not
+                  byte-identical, so this rebuilds the release of an earlier run
 """
 
 import argparse
@@ -64,7 +70,7 @@ ROTARY_EMBEDDING = contrib_op("RotaryEmbedding",
                               {"input": "T", "position_ids": "M", "cos_cache": "T", "sin_cache": "T"},
                               {"num_heads": _S.AttrType.INT})
 
-ASSET_VERSION = "v2"
+ASSET_VERSION = "v3"
 HF_REPO = "vllm-sr/vela3-fast"
 HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb"
 # Everything the decision backbone needs; the span and router adapters are not used.
@@ -76,6 +82,9 @@ BLOCK = 128
 # 129-token switch from global to blocked attention in the sliding-window layers, several blocks, and long.
 VERIFY_CASES = [(3, 2), (40, 3), (123, 2), (124, 2), (125, 4), (127, 5), (300, 3), (1100, 4), (4000, 5), (9000, 2)]
 VERIFY_TOLERANCE = 1e-3
+# The released graph: int8 encoder projections, symmetric, in blocks of INT8_BLOCK input rows.
+INT8_BLOCK = 128
+VERIFY_INT8_TOLERANCE = 1e-1  # observed worst case: about 4e-2
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HEADER_PATH = REPO_ROOT / "src" / "include" / "decide_onnx" / "model_manifest.hpp"
 
@@ -260,9 +269,59 @@ def verify_prompt(reference, length, options, seed):
     return dict(ids=ids, q_pos=1, opt_pos=positions, names=[str(i) for i in range(options)], pool=(state_start, len(ids) - 1))
 
 
-def verify_graph(reference, path: Path) -> None:
+def store_compact(src: Path, dst: Path) -> None:
+    """Rewrite the fp32 graph with its weights stored compactly; the values ONNX Runtime computes from them are fp32.
+    - The 168 encoder projections (q, k, v, o, gate, up, down of 24 layers) become int8, symmetric, in blocks of
+      INT8_BLOCK along the input dimension, read back by a blocked DequantizeLinear. The scales are those of ONNX
+      Runtime's 8-bit MatMulNBits quantizer: the largest weight of a block maps to -128.
+    - The token embedding becomes fp16, read back by a Cast. An int8 embedding doubled the error.
+    - The readout head and the small tensors stay fp32."""
+    model = onnx.load(str(src))
+    graph = model.graph
+    for opset in model.opset_import:
+        if opset.domain in ("", "ai.onnx"):
+            opset.version = max(opset.version, 21)  # DequantizeLinear with block_size
+    uses = {}
+    for node in graph.node:
+        for i, name in enumerate(node.input):
+            uses.setdefault(name, set()).add((node.op_type, i))
+    keep, nodes, projections = [], [], 0
+    for init in graph.initializer:
+        name, kind = init.name, uses.get(init.name)
+        if init.data_type == onnx.TensorProto.FLOAT and kind == {("MatMul", 1)} and min(init.dims) >= 1024:
+            w = onnx.numpy_helper.to_array(init)
+            rows, cols = w.shape
+            blocks = w.reshape(rows // INT8_BLOCK, INT8_BLOCK, cols)
+            peak = np.take_along_axis(blocks, np.abs(blocks).argmax(axis=1)[:, None, :], axis=1)
+            scale = (peak / -128).astype(np.float32)
+            scale[scale == 0] = 1
+            q = np.clip(np.rint(blocks / scale), -128, 127).astype(np.int8)
+            keep += [onnx.numpy_helper.from_array(q.reshape(rows, cols), name + "__int8"),
+                     onnx.numpy_helper.from_array(scale[:, 0, :], name + "__scale")]
+            nodes.append(onnx.helper.make_node("DequantizeLinear", [name + "__int8", name + "__scale"], [name],
+                                               axis=0, block_size=INT8_BLOCK))
+            projections += 1
+        elif init.data_type == onnx.TensorProto.FLOAT and kind == {("Gather", 0)}:
+            keep.append(onnx.numpy_helper.from_array(onnx.numpy_helper.to_array(init).astype(np.float16), name + "__fp16"))
+            nodes.append(onnx.helper.make_node("Cast", [name + "__fp16"], [name], to=onnx.TensorProto.FLOAT))
+        else:
+            keep.append(init)
+    if projections != 168:
+        raise SystemExit(f"expected the 168 encoder projections, found {projections}")
+    del graph.initializer[:]
+    graph.initializer.extend(keep)
+    graph_nodes = list(graph.node)
+    del graph.node[:]
+    graph.node.extend(nodes + graph_nodes)
+    onnx.save_model(model, str(dst))
+
+
+def verify_graph(reference, path: Path, tolerance: float) -> None:
     """Compare ONNX Runtime with the unmodified `DecisionEncoder.forward_recs`; raise on mismatch."""
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    options = ort.SessionOptions()
+    # As the extension runs it: fold the int8 weights into fp32 rather than fusing them into MatMulNBits.
+    options.add_session_config_entry("session.disable_quant_qdq", "1")
+    session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
     for n, (length, options) in enumerate(VERIFY_CASES):
         rec = verify_prompt(reference, length, options, seed=n)
         with torch.inference_mode():
@@ -274,7 +333,7 @@ def verify_graph(reference, path: Path) -> None:
                                     "state_start": np.array([rec["pool"][0]], np.int64)})[0]
         err = float(np.abs(logits - expected).max())
         print(f"  verify T={len(rec['ids'])} options={options}: max abs logit err {err:.3e}")
-        if logits.shape != expected.shape or not err <= VERIFY_TOLERANCE:
+        if logits.shape != expected.shape or not err <= tolerance:
             raise SystemExit(f"verification failed for {path.name}: T={len(rec['ids'])}")
 
 
@@ -335,14 +394,19 @@ static constexpr uint64_t CONTEXT_TOKENS = {context_tokens};
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "out")
+    parser.add_argument("--skip-export", action="store_true", help="reuse out/model_fp32.onnx")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
     print(f"exporting {HF_REPO}@{HF_REVISION}")
     reference, snapshot = load_reference()
-    onnx_path = args.out / "model.onnx"
-    export_graph(reference, onnx_path)
-    verify_graph(reference, onnx_path)
+    fp32_path, onnx_path = args.out / "model_fp32.onnx", args.out / "model.onnx"
+    if not args.skip_export:
+        export_graph(reference, fp32_path)
+    verify_graph(reference, fp32_path, VERIFY_TOLERANCE)
+    print("storing the weights as int8")
+    store_compact(fp32_path, onnx_path)
+    verify_graph(reference, onnx_path, VERIFY_INT8_TOLERANCE)
     shutil.copyfile(snapshot / "tokenizer.json", args.out / "tokenizer.json")
     shutil.copyfile(snapshot / "LICENSE", args.out / "LICENSE")
 

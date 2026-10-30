@@ -37,17 +37,17 @@ SELECT count(*) FROM results;
 ----
 9
 
-# Same probabilities (a different ONNX Runtime build may round differently)
+# Same probabilities, up to the int8 storage of the weights (the largest difference is about 0.007)
 query I
 SELECT case_id FROM results
 WHERE len(expected) <> cardinality(d.probabilities)
-   OR list_max(list_transform(range(1, len(expected) + 1), lambda i: abs(expected[i] - d.probabilities[keys[i]]))) > 1e-4
+   OR list_max(list_transform(range(1, len(expected) + 1), lambda i: abs(expected[i] - d.probabilities[keys[i]]))) > 2e-2
 ORDER BY case_id;
 ----
 
 # The choice is the most likely option, and the confidence its probability
 query I
-SELECT bool_and(d.choice = keys[list_position(expected, list_max(expected))] AND abs(d.confidence - list_max(expected)) < 1e-4)
+SELECT bool_and(d.choice = keys[list_position(expected, list_max(expected))] AND abs(d.confidence - list_max(expected)) < 2e-2)
 FROM results;
 ----
 true
@@ -57,7 +57,7 @@ query I
 SELECT case_id FROM cases
 WHERE kind = 'choose' AND list_max(descriptions) = ''
   AND list_max(list_transform(range(1, len(expected) + 1),
-                              lambda i: abs(expected[i] - decision_choose(state, question, keys).probabilities[keys[i]]))) > 1e-4;
+                              lambda i: abs(expected[i] - decision_choose(state, question, keys).probabilities[keys[i]]))) > 2e-2;
 ----
 
 # decision_yes_no is P(yes), the second of the reference's options {no, yes}
@@ -65,14 +65,14 @@ query I
 SELECT case_id FROM cases
 WHERE kind = 'yes_no'
   AND abs(CASE WHEN state_is_json THEN decision_yes_no(state::JSON, question) ELSE decision_yes_no(state, question) END
-          - expected[2]) > 1e-4
+          - expected[2]) > 2e-2
 ORDER BY case_id;
 ----
 
 # A STRUCT reads like the same JSON object
 query I
 SELECT abs(decision_yes_no({subject: 'Broken mug', message: 'The order arrived broken. I want my money back.'},
-                           'Is the customer asking for a refund or an exchange?') - expected[2]) < 1e-4
+                           'Is the customer asking for a refund or an exchange?') - expected[2]) < 2e-2
 FROM cases WHERE case_id = 3;
 ----
 true

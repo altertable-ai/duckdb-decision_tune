@@ -10,7 +10,7 @@ SELECT decide_onnx_version().onnxruntime LIKE '1.%', decide_onnx_version().model
 true	vela3-fast
 
 query IIII
-SELECT file_name, file_bytes > 0, url = 'https://assets.altertable.ai/decide_onnx/v2/' || file_name, local_path LIKE '%/decide_onnx/v2/' || file_name
+SELECT file_name, file_bytes > 0, url = 'https://assets.altertable.ai/decide_onnx/v3/' || file_name, local_path LIKE '%/decide_onnx/v3/' || file_name
 FROM decide_onnx_models() ORDER BY file_name;
 ----
 model.onnx	true	true	true

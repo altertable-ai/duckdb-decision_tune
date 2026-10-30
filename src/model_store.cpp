@@ -16,9 +16,9 @@ namespace duckdb {
 namespace decide_onnx {
 
 //! Where scripts/export uploads the files of ASSET_VERSION.
-static constexpr const char *DEFAULT_MODEL_URL = "https://assets.altertable.ai/decide_onnx/v2";
-static constexpr const char *DEFAULT_CACHE_DIR = "~/.duckdb/decide_onnx/v2";
-//! Next to a verified file: "<sha256> <bytes> <mtime>", so later processes skip hashing 1.5 GB again.
+static constexpr const char *DEFAULT_MODEL_URL = "https://assets.altertable.ai/decide_onnx/v3";
+static constexpr const char *DEFAULT_CACHE_DIR = "~/.duckdb/decide_onnx/v3";
+//! Next to a verified file: "<sha256> <bytes> <mtime>", so later processes skip hashing the model again.
 static constexpr const char *VERIFIED_SUFFIX = ".verified";
 static constexpr idx_t IO_CHUNK = 8 * 1024 * 1024;
 
