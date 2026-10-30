@@ -209,13 +209,16 @@ HTTP. The figures below are as published in October 2026. Only the vela3-fast th
 | Weights | Open, Apache-2.0, 380M parameters | Closed | Closed |
 | Price | No per-call cost | $0.042 per million input tokens, output free[^typesafe] | $0.10 per million input tokens, output free[^openai] |
 | Speed | About 50 ms per decision on one core; 20 to 48 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
-| Decision Index | 50.36 public index, 29.27 full score (board 0.4.1)[^card] | 57.89 (kit 0.2.1)[^kit] | Not published |
+| Decision Index, public index[^board] | 50.36 | 60.70 (Jev 1.14) | Not published |
+| Decision Index, full score[^board] | 29.27 | 60.24 (Jev 1.14) | Not published |
 | Context | 32,768 tokens | 262,144 tokens[^openrouter] | Not published |
 | Your data | Stays on your machine | Sent to TypeSafe | Sent to OpenAI |
 
 The [Decision Index](https://github.com/apolinario/decision-index) is chance-corrected: 0 is random guessing and
-100 is perfect. vela3-fast has the highest public index of the board's models up to 500M parameters. The two scores
-in the table come from different versions of the index, so they do not compare directly. OpenAI has published no
+100 is perfect. The public index covers 37 public benchmarks. The full score is the board's ranking, which adds
+private tests that only the board's maintainers run. Both rows come from the same board run. Jev scores 10.3 points
+above vela3-fast on the public index and about twice its full score. vela3-fast has the highest public index of
+the board's models up to 500M parameters, 21.5 points above DecisionTune 1.0 (28.85). OpenAI has published no
 Decision Index score; TechCrunch reports that it ranks 14th on Artificial Analysis's Decision Index, where the
 latest Jev ranks 3rd.[^techcrunch]
 
@@ -232,10 +235,9 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 [^openai]: [OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions): `POST /v1/decisions`,
     up to 400 questions per request about one shared input.
 [^techcrunch]: [TechCrunch, 22 October 2026](https://techcrunch.com/2026/10/22/openai-makes-its-jev-competitor-widely-available-as-decision-model-competition-heats-up/).
-[^card]: [vela3-fast model card](https://huggingface.co/vllm-sr/vela3-fast): Decision Index 0.4.1 board, 28 October
-    2026. The public index is the 37 public benchmarks; the full score adds the board's private tests.
-[^kit]: [Decision Index reproduction kit](https://github.com/apolinario/decision-index), reference score in its
-    0.2.1 parity test.
+[^board]: [Decision Index board](https://huggingface.co/spaces/multimodalart/jev-decision-index), data of 29
+    October 2026 (public panel `decision-index-0.3`). The vela3-fast numbers match its
+    [model card](https://huggingface.co/vllm-sr/vela3-fast).
 [^openrouter]: [OpenRouter Jev guide](https://openrouter.ai/docs/guides/community/jev). Requests over about 32,000
     bytes use a slower, less accurate long-context mode.
 
