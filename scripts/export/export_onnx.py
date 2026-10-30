@@ -16,9 +16,12 @@ The encoder and the readout become one ONNX graph, for one prompt at a time:
 The graph is not a trace of the published modeling code, which builds dense [T, T] attention masks and scores:
 O(T^2) memory, about 7 GB at 8K tokens on a CPU. `Encoder` below runs the same weights on ONNX Runtime's own
 kernels, with memory linear in T:
-- the 8 global layers are `com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash attention;
+- the 8 global layers are `com.microsoft.MultiHeadAttention`. Up to GEMM_ATTENTION_MAX tokens, an `If` gives it an
+  all-ones key_padding_mask, which makes ONNX Runtime compute the [heads, T, T] scores with its GEMM (KleidiAI SME on
+  arm64): about twice as fast as its flash attention, whose GEMMs are plain NEON, for 512 MB of scores at most. Longer
+  prompts take the flash attention, whose memory is linear in T;
 - the 16 sliding-window layers attend in blocks of 128 queries, built from slices of the padded keys; a prompt of
-  at most 129 tokens fits in one window, so an `If` sends it to MultiHeadAttention instead;
+  at most 129 tokens fits in one window, so an `If` sends it to the GEMM MultiHeadAttention instead;
 - RoPE is `com.microsoft.RotaryEmbedding`, so q, k and v stay [1, T, hidden] with no transposes in global layers;
 - RMSNorm is written so that ONNX Runtime fuses it into `SimplifiedLayerNormalization`.
 
@@ -55,22 +58,29 @@ _S = onnx.defs.OpSchema
 
 def contrib_op(name, inputs, attributes):
     """An ONNX Runtime contrib op, which `onnx` has no schema for: the part of its schema the export uses.
-    `inputs` maps each input to its type ("T": float, "M": int64)."""
+    `inputs` maps each input to its type ("T": float, "M": int64, "I": int32); a trailing "?" makes it optional."""
+    def parameter(n, t):
+        if t.endswith("?"):
+            return _S.FormalParameter(n, t[:-1], "", param_option=_S.FormalParameterOption.Optional)
+        return _S.FormalParameter(n, t)
+
     schema = _S(name, "com.microsoft", 1,
-                inputs=[_S.FormalParameter(n, t) for n, t in inputs.items()],
+                inputs=[parameter(n, t) for n, t in inputs.items()],
                 outputs=[_S.FormalParameter("output", "T")],
-                type_constraints=[("T", ["tensor(float)"], ""), ("M", ["tensor(int64)"], "")],
+                type_constraints=[("T", ["tensor(float)"], ""), ("M", ["tensor(int64)"], ""),
+                                  ("I", ["tensor(int32)"], "")],
                 attributes=[_S.Attribute(n, t, "") for n, t in attributes.items()])
     return onnxscript.values.Op(onnxscript.values.Opset("com.microsoft", 1), name, schema)
 
 
-MULTI_HEAD_ATTENTION = contrib_op("MultiHeadAttention", {"query": "T", "key": "T", "value": "T"},
+MULTI_HEAD_ATTENTION = contrib_op("MultiHeadAttention",
+                                  {"query": "T", "key": "T", "value": "T", "bias": "T?", "key_padding_mask": "I?"},
                                   {"num_heads": _S.AttrType.INT, "scale": _S.AttrType.FLOAT})
 ROTARY_EMBEDDING = contrib_op("RotaryEmbedding",
                               {"input": "T", "position_ids": "M", "cos_cache": "T", "sin_cache": "T"},
                               {"num_heads": _S.AttrType.INT})
 
-ASSET_VERSION = "v3"
+ASSET_VERSION = "v4"
 HF_REPO = "vllm-sr/vela3-fast"
 HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb"
 # Everything the decision backbone needs; the span and router adapters are not used.
@@ -78,9 +88,13 @@ HF_FILES = ["*.py", "*.json", "model.safetensors", "LICENSE", "SHA256SUMS"]
 INPUT_NAMES = ["input_ids", "positions", "state_start"]
 OUTPUT_NAMES = ["logits"]
 BLOCK = 128
+# Longest prompt whose global layers compute the full [heads, T, T] scores (8 heads: 512 MB at 4,096 tokens).
+GEMM_ATTENTION_MAX = 4096
 # (body tokens, options) checked against PyTorch; a prompt is body + options + 4 tokens. Short, both sides of the
-# 129-token switch from global to blocked attention in the sliding-window layers, several blocks, and long.
-VERIFY_CASES = [(3, 2), (40, 3), (123, 2), (124, 2), (125, 4), (127, 5), (300, 3), (1100, 4), (4000, 5), (9000, 2)]
+# 129-token switch from global to blocked attention in the sliding-window layers, several blocks, both sides of
+# GEMM_ATTENTION_MAX, and long.
+VERIFY_CASES = [(3, 2), (40, 3), (123, 2), (124, 2), (125, 4), (127, 5), (300, 3), (1100, 4), (4090, 2), (4091, 2),
+                (9000, 2)]
 VERIFY_TOLERANCE = 1e-3
 # The released graph: int8 encoder projections, symmetric, in blocks of INT8_BLOCK input rows.
 INT8_BLOCK = 128
@@ -125,7 +139,8 @@ def onnx_rotary_embedding(x, position_ids, cos, sin, num_heads: int):
 
 @torch.library.custom_op("decide_onnx::global_attention", mutates_args=())
 def global_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, scale: float) -> torch.Tensor:
-    """Unmasked attention over [1, T, heads * dim] inputs; exported as com.microsoft.MultiHeadAttention."""
+    """Unmasked attention over [1, T, heads * dim] inputs; exported as com.microsoft.MultiHeadAttention, which runs
+    it as a flash attention."""
     split = lambda x: x.reshape(1, x.shape[1], num_heads, -1).transpose(1, 2)
     out = F.scaled_dot_product_attention(split(q), split(k), split(v), scale=scale)
     return out.transpose(1, 2).reshape(q.shape)
@@ -138,6 +153,23 @@ def _(q, k, v, num_heads, scale):
 
 def onnx_global_attention(q, k, v, num_heads: int, scale: float):
     return MULTI_HEAD_ATTENTION(q, k, v, num_heads=num_heads, scale=scale)
+
+
+@torch.library.custom_op("decide_onnx::gemm_attention", mutates_args=())
+def gemm_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, keep: torch.Tensor, num_heads: int,
+                   scale: float) -> torch.Tensor:
+    """`global_attention` with `keep`, int32 ones [1, T], as the key_padding_mask of MultiHeadAttention. It masks
+    nothing, but any mask makes ONNX Runtime skip its flash attention for the unfused one, whose GEMMs are faster."""
+    return global_attention(q, k, v, num_heads, scale)
+
+
+@gemm_attention.register_fake
+def _(q, k, v, keep, num_heads, scale):
+    return torch.empty_like(q)
+
+
+def onnx_gemm_attention(q, k, v, keep, num_heads: int, scale: float):
+    return MULTI_HEAD_ATTENTION(q, k, v, None, keep, num_heads=num_heads, scale=scale)
 
 
 def local_attention(q, k, v, window, scale):
@@ -193,6 +225,7 @@ class Encoder(torch.nn.Module):
             freqs = torch.arange(length, dtype=torch.float32)[:, None] * inv_freq[None, :]
             rope[theta] = (freqs.cos(), freqs.sin())
         heads = cfg.num_attention_heads
+        keep = torch.ones((1, length), dtype=torch.int32)
         for i, layer in enumerate(encoder.layers):
             attn = layer.self_attn
             x = rms_norm(layer.input_layernorm, h)
@@ -203,13 +236,16 @@ class Encoder(torch.nn.Module):
             v = attn.v_proj(x)
             window = cfg.attention_windows[i]
             if window is None:
-                out = global_attention(q, k, v, heads, attn.scaling)
+                out = torch.cond(length <= GEMM_ATTENTION_MAX,
+                                 lambda q, k, v, keep: gemm_attention(q, k, v, keep, heads, attn.scaling),
+                                 lambda q, k, v, keep: global_attention(q, k, v, heads, attn.scaling),
+                                 (q, k, v, keep))
             else:
                 # A prompt of at most window + 1 tokens attends everywhere: the global kernel is exact and cheaper.
                 out = torch.cond(length <= window + 1,
-                                 lambda q, k, v: global_attention(q, k, v, heads, attn.scaling),
-                                 lambda q, k, v: blocked_attention(q, k, v, heads, window, attn.scaling),
-                                 (q, k, v))
+                                 lambda q, k, v, keep: gemm_attention(q, k, v, keep, heads, attn.scaling),
+                                 lambda q, k, v, keep: blocked_attention(q, k, v, heads, window, attn.scaling),
+                                 (q, k, v, keep))
             h = h + attn.o_proj(out)
             x = rms_norm(layer.post_attention_layernorm, h)
             h = h + layer.mlp(x)
@@ -242,6 +278,7 @@ def export_graph(reference, path: Path) -> None:
             input_names=INPUT_NAMES,
             output_names=OUTPUT_NAMES,
             custom_translation_table={torch.ops.decide_onnx.global_attention.default: onnx_global_attention,
+                                      torch.ops.decide_onnx.gemm_attention.default: onnx_gemm_attention,
                                       torch.ops.decide_onnx.rotary_embedding.default: onnx_rotary_embedding},
             dynamic_shapes={
                 "input_ids": {1: torch.export.Dim("length", min=4, max=32768)},

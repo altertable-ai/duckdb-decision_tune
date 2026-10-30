@@ -20,12 +20,16 @@ and the model's Python files); the span and router adapters are not needed.
 `DecisionEncoder` of `vela3_encoder.py` (the UltraBERT-380M encoder and its cosine + MLP readout) becomes one
 graph for one prompt at a time. Its inputs and outputs are documented at the top of `export_onnx.py`. The graph
 runs the published weights, but not the published forward code. That code builds dense `[T, T]` attention masks,
-which needs about 7 GB at 8K tokens on a CPU. The export keeps memory linear in the prompt length instead, and
-maps each part of the network onto an ONNX Runtime kernel:
-- The 8 global layers use `com.microsoft.MultiHeadAttention`, whose CPU kernel is a flash attention.
+which needs about 7 GB at 8K tokens on a CPU. The export bounds that memory instead (linear in the prompt length
+past 4,096 tokens), and maps each part of the network onto an ONNX Runtime kernel:
+- The 8 global layers use `com.microsoft.MultiHeadAttention`. Its CPU kernel is a flash attention, but its GEMMs
+  are plain NEON. Given a `key_padding_mask`, it computes the `[heads, T, T]` scores with ONNX Runtime's GEMM
+  instead, which runs on KleidiAI's SME kernels on arm64 and is about twice as fast. So up to 4,096 tokens
+  (`GEMM_ATTENTION_MAX`, 512 MB of scores), an `If` passes it an all-ones mask, which masks nothing. Longer prompts
+  take the flash attention, whose memory is linear in the prompt length.
 - The 16 sliding-window layers attend in blocks of 128 queries. Each block's keys are three slices of the padded
   keys, not a gather. A prompt of at most 129 tokens fits in one window, so an `If` sends it to
-  `MultiHeadAttention` instead, which is exact and cheaper.
+  `MultiHeadAttention` with the mask instead, which is exact and cheaper.
 - RoPE uses `com.microsoft.RotaryEmbedding`, so q, k and v stay `[1, T, hidden]` and the global layers need no
   transposes.
 - RMSNorm is written as `x / sqrt(mean(x^2) + eps)`, which ONNX Runtime fuses into
