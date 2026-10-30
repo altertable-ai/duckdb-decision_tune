@@ -7,9 +7,13 @@ require decide_onnx
 statement ok
 SET decide_onnx_cache_dir = '{TEST_DIR}';
 
+# read the size before writing the file: decide_onnx_models() opens it, which Windows refuses while COPY writes it
+statement ok
+SET VARIABLE tokenizer_bytes = (SELECT file_bytes FROM decide_onnx_models() WHERE file_name = 'tokenizer.json');
+
 # same name and size as the real file, wrong content (csv adds the trailing newline)
 statement ok
-COPY (SELECT repeat('x', (SELECT file_bytes - 1 FROM decide_onnx_models() WHERE file_name = 'tokenizer.json')::BIGINT))
+COPY (SELECT repeat('x', (getvariable('tokenizer_bytes') - 1)::BIGINT))
 TO '{TEST_DIR}/tokenizer.json' (FORMAT csv, HEADER false, QUOTE '');
 
 query I
