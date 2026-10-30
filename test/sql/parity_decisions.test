@@ -23,6 +23,10 @@ SELECT count(*) FROM cases;
 ----
 14
 
+# On one thread, the cases share forward passes (short prompts are packed together)
+statement ok
+SET threads = 1;
+
 # A dict state is read as compact JSON; the options as `key: description`, or the key alone
 statement ok
 CREATE TABLE results AS
@@ -36,6 +40,10 @@ query I
 SELECT count(*) FROM results;
 ----
 9
+
+# With more threads than the cases fill, the queries below run each prompt alone
+statement ok
+SET threads = 16;
 
 # Same probabilities, up to the int8 storage of the weights (the largest difference is about 0.007)
 query I

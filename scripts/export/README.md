@@ -18,7 +18,8 @@ and the model's Python files); the span and router adapters are not needed.
 ## What gets exported
 
 `DecisionEncoder` of `vela3_encoder.py` (the UltraBERT-380M encoder and its cosine + MLP readout) becomes one
-graph for one prompt at a time. Its inputs and outputs are documented at the top of `export_onnx.py`. The graph
+graph for one prompt, or a pack of short prompts laid end to end. Its inputs and outputs are documented at the top
+of `export_onnx.py`. The graph
 runs the published weights, but not the published forward code. That code builds dense `[T, T]` attention masks,
 which needs about 7 GB at 8K tokens on a CPU. The export bounds that memory instead (linear in the prompt length
 past 4,096 tokens), and maps each part of the network onto an ONNX Runtime kernel:
@@ -30,6 +31,11 @@ past 4,096 tokens), and maps each part of the network onto an ONNX Runtime kerne
 - The 16 sliding-window layers attend in blocks of 128 queries. Each block's keys are three slices of the padded
   keys, not a gather. A prompt of at most 129 tokens fits in one window, so an `If` sends it to
   `MultiHeadAttention` with the mask instead, which is exact and cheaper.
+- A pack holds prompts of at most 129 tokens (`PACK_PROMPT_MAX`), so a sliding window spans each whole prompt. Every
+  layer of a pack is `MultiHeadAttention` with an `attention_bias` that is 0 within a prompt and the lowest float
+  across prompts, built from the `segment_ids` input. Positions restart with each prompt (`position_ids`), and the
+  readout gathers each option's question and state from its own prompt. The extension packs short prompts into
+  passes of about 128 tokens, which the GEMMs run 1.4 to 1.7 times more efficiently than one short prompt each.
 - RoPE uses `com.microsoft.RotaryEmbedding`, so q, k and v stay `[1, T, hidden]` and the global layers need no
   transposes.
 - RMSNorm is written as `x / sqrt(mean(x^2) + eps)`, which ONNX Runtime fuses into
@@ -53,9 +59,11 @@ back into fp32 when it loads the model and runs the same kernels as the fp32 gra
 option it would fuse them into `MatMulNBits`, which multiplies int8 weights directly: less memory, but up to 8 times
 slower on one core. The fp32 graph is kept as `out/model_fp32.onnx`.
 
-Each export is checked against the unmodified PyTorch `DecisionEncoder` on 10 prompts of 10 to 9,006 tokens,
-including 129 and 130 tokens on both sides of the `If`. A run fails if a logit of the fp32 graph is off by more than
-1e-3 (the observed worst case is about 1e-5), or a logit of the released graph by more than 0.1 (about 0.04).
+Each export is checked against the unmodified PyTorch `DecisionEncoder` on 11 prompts of 10 to 9,006 tokens,
+including 129 and 130 tokens on both sides of the `If`, and on 3 packs of 3 to 9 prompts. A run fails if a logit of
+the fp32 graph is off by more than 1e-3 (the observed worst case is about 1e-5), or a logit of the released graph by
+more than 0.1 (about 0.09). It also fails if a prompt's logits in a pack differ from its own pass by more than 1e-4
+(about 5e-6: float rounding, since the attention sums run over a longer row).
 
 The prompt rendering (`ub_d3_common.to_row` and `DecisionEncoder.encode`) is ported to C++ in
 `src/decision_model.cpp` and `src/state_text.cpp`. The fixtures come from the reference's own

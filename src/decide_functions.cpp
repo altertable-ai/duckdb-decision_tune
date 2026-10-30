@@ -10,7 +10,10 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression.hpp"
+
+#include <functional>
 
 namespace duckdb {
 namespace decide_onnx {
@@ -25,20 +28,18 @@ struct Decision {
 //===--------------------------------------------------------------------===//
 // Scoring
 //===--------------------------------------------------------------------===//
-//! Encodes and scores one decision as a DuckDB task.
-class DecisionTask : public BaseExecutorTask {
+//! One of `count` independent steps (`step(index)`) as a DuckDB task.
+class StepTask : public BaseExecutorTask {
 public:
-	DecisionTask(TaskExecutor &executor, ClientContext &context, DecisionModel &model, const Decision &decision,
-	             std::vector<double> &out)
-	    : BaseExecutorTask(executor), context(context), model(model), decision(decision), out(out) {
+	StepTask(TaskExecutor &executor, ClientContext &context, const std::function<void(idx_t)> &step, idx_t index)
+	    : BaseExecutorTask(executor), context(context), step(step), index(index) {
 	}
 
 	void ExecuteTask() override {
 		if (context.IsInterrupted()) {
 			throw InterruptException();
 		}
-		auto prompt = EncodePrompt(model.Tokenizer(), decision.state, decision.question, decision.options);
-		out = model.Probabilities(prompt);
+		step(index);
 	}
 
 	string TaskType() const override {
@@ -47,10 +48,18 @@ public:
 
 private:
 	ClientContext &context;
-	DecisionModel &model;
-	const Decision &decision;
-	std::vector<double> &out;
+	const std::function<void(idx_t)> &step;
+	idx_t index;
 };
+
+//! Runs `step(0)` .. `step(count - 1)` on DuckDB's scheduler, this thread included, and waits for them.
+static void RunSteps(ClientContext &context, idx_t count, const std::function<void(idx_t)> &step) {
+	TaskExecutor executor(context);
+	for (idx_t i = 0; i < count; i++) {
+		executor.ScheduleTask(make_uniq<StepTask>(executor, context, step, i));
+	}
+	executor.WorkOnTasks();
+}
 
 static string DecisionKey(const Decision &decision) {
 	string key = decision.state;
@@ -64,7 +73,8 @@ static string DecisionKey(const Decision &decision) {
 }
 
 //! The option probabilities of every decision. A chunk's distinct decisions run as tasks on DuckDB's scheduler: a
-//! forward pass takes tens of milliseconds, and a small table is often read by a single thread.
+//! forward pass takes tens of milliseconds, and a small table is often read by a single thread. Short prompts share
+//! forward passes (PlanPasses), which uses the CPU much better than one pass each.
 static vector<std::vector<double>> ScoreDecisions(ClientContext &context, const vector<Decision> &decisions) {
 	vector<std::vector<double>> result(decisions.size());
 	if (decisions.empty()) {
@@ -83,13 +93,34 @@ static vector<std::vector<double>> ScoreDecisions(ClientContext &context, const 
 		unique_index[i] = entry.first->second;
 	}
 
+	// Tokenizing a long state takes a while too, so it runs as tasks as well.
+	vector<Prompt> prompts(unique_decisions.size());
 	vector<std::vector<double>> unique_results(unique_decisions.size());
-	TaskExecutor executor(context);
+	vector<uint8_t> known(unique_decisions.size());
+	RunSteps(context, unique_decisions.size(), [&](idx_t u) {
+		auto &decision = decisions[unique_decisions[u]];
+		prompts[u] = EncodePrompt(model->Tokenizer(), decision.state, decision.question, decision.options);
+		known[u] = model->Lookup(prompts[u], unique_results[u]);
+	});
+
+	vector<idx_t> missing, lengths;
 	for (idx_t u = 0; u < unique_decisions.size(); u++) {
-		executor.ScheduleTask(
-		    make_uniq<DecisionTask>(executor, context, *model, decisions[unique_decisions[u]], unique_results[u]));
+		if (!known[u]) {
+			missing.push_back(u);
+			lengths.push_back(prompts[u].ids.size());
+		}
 	}
-	executor.WorkOnTasks();
+	auto passes = PlanPasses(lengths, TaskScheduler::GetScheduler(context).NumberOfThreads());
+	RunSteps(context, passes.size(), [&](idx_t p) {
+		vector<const Prompt *> pack;
+		for (auto i : passes[p]) {
+			pack.push_back(&prompts[missing[i]]);
+		}
+		auto probabilities = model->Probabilities(pack);
+		for (idx_t i = 0; i < pack.size(); i++) {
+			unique_results[missing[passes[p][i]]] = std::move(probabilities[i]);
+		}
+	});
 	for (idx_t i = 0; i < decisions.size(); i++) {
 		result[i] = unique_results[unique_index[i]];
 	}

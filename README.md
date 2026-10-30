@@ -48,11 +48,11 @@ LOAD decide_onnx;
 query ends, and this includes the connection that runs `LOAD`. So send `LOAD decide_onnx` and the first `DECIDE`
 query as two separate statements, not as one string.
 
-The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v4/`.
+The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v5/`.
 That is `tokenizer.json` (3.5 MB) and `model.onnx` (452 MB), an ONNX export of the decision backbone of one pinned
 commit of the Hugging Face repository (see [scripts/export](scripts/export/README.md)). The file stores the weights
 as int8 and fp16; ONNX Runtime turns them back into float32 when the model loads. The extension checks each
-file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v4/`. The model loads when a
+file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v5/`. The model loads when a
 query first needs an answer, not when the query is bound, so `DESCRIBE` of a `DECIDE` query stays fast. The
 optimizer may compute a call whose arguments are all constants while it plans the query.
 
@@ -168,22 +168,27 @@ labeled rows, and send the unsure rows to a person.
 
 ## Performance
 
-Every question for every row is one forward pass of the 380M encoder. The extension spreads the decisions of each
-chunk of rows over DuckDB's worker threads, so `SET threads` sets the parallelism. ONNX Runtime itself runs
-single-threaded. Measured on an Apple M4 Pro (10 performance and 4 efficiency cores), with tickets of about 20
+Every question for every row goes through the 380M encoder. The extension spreads the decisions of each chunk of
+rows over DuckDB's worker threads, so `SET threads` sets the parallelism. ONNX Runtime itself runs
+single-threaded. Measured on an Apple M4 Pro (10 performance and 4 efficiency cores), with tickets of about 27
 tokens and one yes/no question each:
 
 | Threads | Decisions per second |
 |---|---|
-| 1 | 20 (about 50 ms each) |
-| 4 | 46 |
-| 8 | 48 |
-| 14 | 47 |
+| 1 | 31 |
+| 4 | 71 |
+| 8 | 79 |
+| 14 | 80 |
+
+Short prompts share forward passes. The matrix multiplications run in blocks of 32 tokens, so a 33-token prompt
+alone costs about as much as a 64-token one, and they are most efficient from about 128 tokens. So the prompts of
+at most 129 tokens of a chunk are packed into passes of about 128 tokens, each prompt attending only to itself.
+That scores 1.4 to 1.7 times more decisions per second than one pass per prompt. A single decision still takes
+about 45 ms. Packing changes probabilities by about 1e-6 at most, depending on which prompts share a pass.
 
 Throughput stops growing after a few threads. On Apple silicon the matrix multiplications run on the SME matrix
-units, which each cluster of cores shares, so more threads wait for the same units. The ONNX graph scores one
-prompt per pass, and each pass multiplies by all 1.5 GB of float32 weights, in blocks of 32 tokens: a 33-token
-prompt costs about as much as a 64-token one. 10,000 rows with two questions therefore take about seven minutes.
+units, which each cluster of cores shares, so more threads wait for the same units. 10,000 rows with two questions
+take about four minutes.
 
 Long prompts cost much more, because 8 of the 24 layers attend over the whole prompt. One prompt runs on one core:
 
@@ -211,7 +216,7 @@ HTTP. The figures below are as published in October 2026. Only the vela3-fast th
 | Runs | In DuckDB, on your CPU | Hosted API | Hosted API (`gpt-6-luna`) |
 | Weights | Open, Apache-2.0, 380M parameters | Closed | Closed |
 | Price | No per-call cost | $0.042 per million input tokens, output free[^typesafe] | $0.10 per million input tokens, output free[^openai] |
-| Speed | About 50 ms per decision on one core; 20 to 48 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
+| Speed | About 45 ms for one decision on one core; 31 to 80 decisions per second on an Apple M4 Pro (above) | 0.114 s for an example workflow[^typesafe] | 100 to 180 ms per response[^techcrunch] |
 | Decision Index, public index[^board] | 50.36 | 60.70 (Jev 1.14) | Not published |
 | Decision Index, full score[^board] | 29.27 | 60.24 (Jev 1.14) | Not published |
 | Context | 32,768 tokens | 262,144 tokens[^openrouter] | Not published |
@@ -248,8 +253,8 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v4'` | The URL the files are downloaded from. A local directory also works. |
-| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v4'` | Where the downloaded files are cached. |
+| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v5'` | The URL the files are downloaded from. A local directory also works. |
+| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v5'` | Where the downloaded files are cached. |
 | `decide_onnx_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`. The files are not checksummed. |
 
 ### Offline use
@@ -284,7 +289,8 @@ To use the extension on a machine without internet access, do one of these:
   PyTorch code. It bounds memory and uses ONNX Runtime's fused kernels: `com.microsoft.MultiHeadAttention` for
   the global layers and for short prompts (computing the scores with the GEMM up to 4,096 tokens, as a flash
   attention beyond), blocked attention for the sliding-window layers, `RotaryEmbedding` and
-  `SimplifiedLayerNormalization`. See
+  `SimplifiedLayerNormalization`. One pass scores one prompt or a pack of short prompts laid end to end, with an
+  attention bias that keeps each prompt to its own tokens. See
   [scripts/export](scripts/export/README.md).
 - **Syntax.** `DECIDE` and the `AMONG` / `GIVEN` call forms are additions to DuckDB's PEG grammar. They are
   registered as the `decide_onnx` grammar extension (`src/decide_grammar.cpp`). They only add rules and choices
@@ -336,7 +342,7 @@ Tests that need the model are skipped unless you point them at a directory that 
 `model.onnx`. The extension's own cache directory works:
 
 ```bash
-DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v4 make test
+DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v5 make test
 ```
 
 To export the model again or regenerate the parity fixtures, see [scripts/export](scripts/export/README.md).

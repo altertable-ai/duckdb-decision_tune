@@ -48,28 +48,30 @@ OrtScorer::OrtScorer(const string &onnx_path) : impl(make_uniq<Impl>()) {
 
 OrtScorer::~OrtScorer() = default;
 
-std::vector<float> OrtScorer::Logits(const std::vector<int64_t> &ids, const std::vector<int64_t> &positions,
-                                     int64_t state_start) {
-	int64_t sequence_shape[] = {1, NumericCast<int64_t>(ids.size())};
-	int64_t positions_shape[] = {NumericCast<int64_t>(positions.size())};
-	int64_t state_start_shape[] = {1};
+std::vector<float> OrtScorer::Logits(const ScorerInput &input) {
+	int64_t sequence_shape[] = {1, NumericCast<int64_t>(input.ids.size())};
+	int64_t options_shape[] = {NumericCast<int64_t>(input.positions.size())};
+	auto &mem = impl->memory_info;
+	auto tensor = [&](const std::vector<int64_t> &data, int64_t *shape, size_t rank) {
+		return Ort::Value::CreateTensor<int64_t>(mem, const_cast<int64_t *>(data.data()), data.size(), shape, rank);
+	};
 	try {
-		auto &mem = impl->memory_info;
 		Ort::Value values[] = {
-		    Ort::Value::CreateTensor<int64_t>(mem, const_cast<int64_t *>(ids.data()), ids.size(), sequence_shape, 2),
-		    Ort::Value::CreateTensor<int64_t>(mem, const_cast<int64_t *>(positions.data()), positions.size(),
-		                                      positions_shape, 1),
-		    Ort::Value::CreateTensor<int64_t>(mem, &state_start, 1, state_start_shape, 1)};
-		const char *input_names[] = {"input_ids", "positions", "state_start"};
+		    tensor(input.ids, sequence_shape, 2),         tensor(input.position_ids, sequence_shape, 2),
+		    tensor(input.segment_ids, sequence_shape, 2), tensor(input.positions, options_shape, 1),
+		    tensor(input.questions, options_shape, 1),    tensor(input.state_starts, options_shape, 1),
+		    tensor(input.state_ends, options_shape, 1)};
+		const char *input_names[] = {"input_ids", "position_ids", "segment_ids", "positions",
+		                             "questions", "state_starts", "state_ends"};
 		const char *output_names[] = {"logits"};
-		auto outputs = impl->session->Run(Ort::RunOptions {nullptr}, input_names, values, 3, output_names, 1);
+		auto outputs = impl->session->Run(Ort::RunOptions {nullptr}, input_names, values, 7, output_names, 1);
 		auto info = outputs[0].GetTensorTypeAndShapeInfo();
-		if (info.GetElementCount() != positions.size()) {
+		if (info.GetElementCount() != input.positions.size()) {
 			throw InternalException("decide_onnx: model returned %llu logits, expected %llu", info.GetElementCount(),
-			                        positions.size());
+			                        input.positions.size());
 		}
 		auto data = outputs[0].GetTensorData<float>();
-		return std::vector<float>(data, data + positions.size());
+		return std::vector<float>(data, data + input.positions.size());
 	} catch (const Ort::Exception &ex) {
 		throw InvalidInputException("decide_onnx: model inference failed: %s", ex.what());
 	}

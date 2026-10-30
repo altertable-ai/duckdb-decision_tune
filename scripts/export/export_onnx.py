@@ -6,12 +6,20 @@ is one question:
 
     [BOS] [Q] question [O] option_1 [O] option_2 ... [SEP_SCHEMA] [SEG_user] state [EOS]
 
-The encoder and the readout become one ONNX graph, for one prompt at a time:
+The encoder and the readout become one ONNX graph, for one prompt or a pack of short prompts laid end to end:
 
-    input_ids    int64 [1, T]   the prompt
-    positions    int64 [K]      the position of the [O] before each option
-    state_start  int64 [1]      the position of [SEG_user]
-    -> logits    float32 [K]    softmax over them gives the option probabilities
+    input_ids     int64 [1, T]   the prompts
+    position_ids  int64 [1, T]   each token's position within its prompt
+    segment_ids   int64 [1, T]   each token's prompt: 0, 1, ... in order (all 0 for one prompt)
+    positions     int64 [K]      the position of the [O] before each option, over all prompts
+    questions     int64 [K]      the position of the [Q] of each option's prompt
+    state_starts  int64 [K]      the position of the [SEG_user] of each option's prompt
+    state_ends    int64 [K]      the position of the final [EOS] of each option's prompt
+    -> logits     float32 [K]    a softmax over the options of each prompt gives its probabilities
+
+A pack (more than one segment) may only hold prompts of at most PACK_PROMPT_MAX tokens: a sliding window then spans
+each whole prompt, so every layer is exact with block-diagonal attention. A pack of short prompts uses the CPU much
+better than each prompt alone: the GEMMs run in blocks of 32 rows, and short passes are their least efficient size.
 
 The graph is not a trace of the published modeling code, which builds dense [T, T] attention masks and scores:
 O(T^2) memory, about 7 GB at 8K tokens on a CPU. `Encoder` below runs the same weights on ONNX Runtime's own
@@ -22,6 +30,8 @@ kernels, with memory linear in T:
   prompts take the flash attention, whose memory is linear in T;
 - the 16 sliding-window layers attend in blocks of 128 queries, built from slices of the padded keys; a prompt of
   at most 129 tokens fits in one window, so an `If` sends it to the GEMM MultiHeadAttention instead;
+- in a pack, every layer is the GEMM MultiHeadAttention with an attention_bias that keeps each prompt to its own
+  keys; a prompt's logits match its own pass up to float rounding;
 - RoPE is `com.microsoft.RotaryEmbedding`, so q, k and v stay [1, T, hidden] with no transposes in global layers;
 - RMSNorm is written so that ONNX Runtime fuses it into `SimplifiedLayerNormalization`.
 
@@ -74,20 +84,23 @@ def contrib_op(name, inputs, attributes):
 
 
 MULTI_HEAD_ATTENTION = contrib_op("MultiHeadAttention",
-                                  {"query": "T", "key": "T", "value": "T", "bias": "T?", "key_padding_mask": "I?"},
+                                  {"query": "T", "key": "T", "value": "T", "bias": "T?", "key_padding_mask": "I?",
+                                   "attention_bias": "T?"},
                                   {"num_heads": _S.AttrType.INT, "scale": _S.AttrType.FLOAT})
 ROTARY_EMBEDDING = contrib_op("RotaryEmbedding",
                               {"input": "T", "position_ids": "M", "cos_cache": "T", "sin_cache": "T"},
                               {"num_heads": _S.AttrType.INT})
 
-ASSET_VERSION = "v4"
+ASSET_VERSION = "v5"
 HF_REPO = "vllm-sr/vela3-fast"
 HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb"
 # Everything the decision backbone needs; the span and router adapters are not used.
 HF_FILES = ["*.py", "*.json", "model.safetensors", "LICENSE", "SHA256SUMS"]
-INPUT_NAMES = ["input_ids", "positions", "state_start"]
+INPUT_NAMES = ["input_ids", "position_ids", "segment_ids", "positions", "questions", "state_starts", "state_ends"]
 OUTPUT_NAMES = ["logits"]
 BLOCK = 128
+# Longest prompt of a pack: one more than the sliding window.
+PACK_PROMPT_MAX = 129
 # Longest prompt whose global layers compute the full [heads, T, T] scores (8 heads: 512 MB at 4,096 tokens).
 GEMM_ATTENTION_MAX = 4096
 # (body tokens, options) checked against PyTorch; a prompt is body + options + 4 tokens. Short, both sides of the
@@ -95,10 +108,15 @@ GEMM_ATTENTION_MAX = 4096
 # GEMM_ATTENTION_MAX, and long.
 VERIFY_CASES = [(3, 2), (40, 3), (123, 2), (124, 2), (125, 4), (127, 5), (300, 3), (1100, 4), (4090, 2), (4091, 2),
                 (9000, 2)]
+# Packs of VERIFY_CASES-style prompts of at most PACK_PROMPT_MAX tokens, checked against PyTorch and against each
+# prompt's own pass.
+VERIFY_PACKS = [[(3, 2), (40, 3), (20, 2)], [(123, 2), (3, 4), (60, 3), (30, 2), (2, 2)], [(26, 5)] * 9]
 VERIFY_TOLERANCE = 1e-3
+# A prompt in a pack against the same prompt alone, same graph: float rounding only.
+VERIFY_PACK_DRIFT = 1e-4
 # The released graph: int8 encoder projections, symmetric, in blocks of INT8_BLOCK input rows.
 INT8_BLOCK = 128
-VERIFY_INT8_TOLERANCE = 1e-1  # observed worst case: about 4e-2
+VERIFY_INT8_TOLERANCE = 1e-1  # observed worst case: about 9e-2
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HEADER_PATH = REPO_ROOT / "src" / "include" / "decide_onnx" / "model_manifest.hpp"
 
@@ -172,6 +190,30 @@ def onnx_gemm_attention(q, k, v, keep, num_heads: int, scale: float):
     return MULTI_HEAD_ATTENTION(q, k, v, None, keep, num_heads=num_heads, scale=scale)
 
 
+@torch.library.custom_op("decide_onnx::packed_attention", mutates_args=())
+def packed_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, num_heads: int,
+                     scale: float) -> torch.Tensor:
+    """`global_attention` plus `bias`, [1, 1, T, T], as the attention_bias of MultiHeadAttention."""
+    split = lambda x: x.reshape(1, x.shape[1], num_heads, -1).transpose(1, 2)
+    out = F.scaled_dot_product_attention(split(q), split(k), split(v), attn_mask=bias, scale=scale)
+    return out.transpose(1, 2).reshape(q.shape)
+
+
+@packed_attention.register_fake
+def _(q, k, v, bias, num_heads, scale):
+    return torch.empty_like(q)
+
+
+def onnx_packed_attention(q, k, v, bias, num_heads: int, scale: float):
+    return MULTI_HEAD_ATTENTION(q, k, v, None, None, bias, num_heads=num_heads, scale=scale)
+
+
+def segment_bias(segment_ids, dtype):
+    """[1, 1, T, T]: 0 where query and key are in the same prompt, the lowest float elsewhere."""
+    same = segment_ids[:, :, None] == segment_ids[:, None, :]
+    return torch.where(same, 0.0, torch.finfo(dtype).min).to(dtype)[:, None]
+
+
 def local_attention(q, k, v, window, scale):
     """Attention over the keys within `window` positions, in blocks of BLOCK queries: O(T * window) memory.
     With window == BLOCK, the keys of block i are the padded blocks i, i + 1 and i + 2: slices, not a gather."""
@@ -205,7 +247,8 @@ def blocked_attention(q, k, v, heads, window, scale):
 
 
 class Encoder(torch.nn.Module):
-    """`DecisionEncoder`'s encoder and readout for one unpadded prompt, on the reference's own modules."""
+    """`DecisionEncoder`'s encoder and readout for one unpadded prompt or a pack of them, on the reference's own
+    modules."""
 
     def __init__(self, reference):
         super().__init__()
@@ -215,11 +258,11 @@ class Encoder(torch.nn.Module):
                                                  / self.config.head_dim))
                          for theta in set(self.config.rope_theta)}
 
-    def forward(self, input_ids, positions, state_start):
+    def forward(self, input_ids, position_ids, segment_ids, positions, questions, state_starts, state_ends):
         encoder, cfg = self.reference.encoder, self.config
         length = input_ids.shape[1]
+        packed = segment_ids[0, -1] > 0
         h = encoder.embed_tokens(input_ids)
-        position_ids = torch.arange(length)[None]
         rope = {}
         for theta, inv_freq in self.inv_freq.items():
             freqs = torch.arange(length, dtype=torch.float32)[:, None] * inv_freq[None, :]
@@ -236,30 +279,41 @@ class Encoder(torch.nn.Module):
             v = attn.v_proj(x)
             window = cfg.attention_windows[i]
             if window is None:
-                out = torch.cond(length <= GEMM_ATTENTION_MAX,
-                                 lambda q, k, v, keep: gemm_attention(q, k, v, keep, heads, attn.scaling),
-                                 lambda q, k, v, keep: global_attention(q, k, v, heads, attn.scaling),
-                                 (q, k, v, keep))
+                single = lambda q, k, v, keep, scale=attn.scaling: torch.cond(
+                    length <= GEMM_ATTENTION_MAX,
+                    lambda q, k, v, keep: gemm_attention(q, k, v, keep, heads, scale),
+                    lambda q, k, v, keep: global_attention(q, k, v, heads, scale),
+                    (q, k, v, keep))
             else:
                 # A prompt of at most window + 1 tokens attends everywhere: the global kernel is exact and cheaper.
-                out = torch.cond(length <= window + 1,
-                                 lambda q, k, v, keep: gemm_attention(q, k, v, keep, heads, attn.scaling),
-                                 lambda q, k, v, keep: blocked_attention(q, k, v, heads, window, attn.scaling),
-                                 (q, k, v, keep))
+                single = lambda q, k, v, keep, scale=attn.scaling, window=window: torch.cond(
+                    length <= window + 1,
+                    lambda q, k, v, keep: gemm_attention(q, k, v, keep, heads, scale),
+                    lambda q, k, v, keep: blocked_attention(q, k, v, heads, window, scale),
+                    (q, k, v, keep))
+            # The bias is built inside the branch: a long single prompt must not pay for a [T, T] tensor.
+            out = torch.cond(packed,
+                             lambda q, k, v, keep, segment_ids, scale=attn.scaling: packed_attention(
+                                 q, k, v, segment_bias(segment_ids, q.dtype), heads, scale),
+                             lambda q, k, v, keep, segment_ids: single(q, k, v, keep),
+                             (q, k, v, keep, segment_ids))
             h = h + attn.o_proj(out)
             x = rms_norm(layer.post_attention_layernorm, h)
             h = h + layer.mlp(x)
         hidden = rms_norm(encoder.norm, h)[0]  # [T, hidden]
-        return self.readout(hidden, positions, state_start)
+        return self.readout(hidden, positions, questions, state_starts, state_ends)
 
-    def readout(self, hidden, positions, state_start):
-        """`DecisionEncoder._logits` for one prompt: the state is pooled from [SEG_user] up to [EOS]."""
+    def readout(self, hidden, positions, questions, state_starts, state_ends):
+        """`DecisionEncoder._logits`, one row per option: the state of its prompt is pooled from [SEG_user] up to
+        [EOS]. The pooling is a [K, T] mask product rather than a cumulative sum, which would carry the rounding of
+        the earlier prompts of a pack."""
         ref = self.reference
-        end = hidden.shape[0] - 1
-        sums = F.pad(hidden.cumsum(0), (0, 0, 1, 0))
-        pooled = (sums[end] - sums[state_start[0]]) / (end - state_start[0]).clamp(min=1).to(hidden.dtype)
+        steps = torch.arange(hidden.shape[0])[None]
+        span = (steps >= state_starts[:, None]) & (steps < state_ends[:, None])
+        count = (state_ends - state_starts).clamp(min=1).to(hidden.dtype)[:, None]
+        pooled = span.to(hidden.dtype) @ hidden / count
         state = F.normalize(ref.w_p(ref.norm(pooled)), dim=-1)
-        question = ref.w_q(ref.norm(hidden[1]))
+        question = ref.w_q(ref.norm(hidden[questions]))
         options = hidden[positions]
         u = F.normalize(ref.w_o(ref.norm(options)) + question, dim=-1)
         return (u * state).sum(-1) / ref.log_tau.exp() + ref.cls_mlp(options).squeeze(-1)
@@ -267,8 +321,12 @@ class Encoder(torch.nn.Module):
 
 def export_graph(reference, path: Path) -> None:
     model = Encoder(reference).eval()
+    length_dim = torch.export.Dim("length", min=4, max=32768)
+    options_dim = torch.export.Dim("options", min=1, max=4096)
     length = 300
-    example = (torch.randint(100, 40000, (1, length)), torch.tensor([2, 9, 17]), torch.tensor([30]))
+    example = (torch.randint(100, 40000, (1, length)), torch.arange(length)[None],
+               torch.zeros(1, length, dtype=torch.long), torch.tensor([2, 9, 17]), torch.tensor([1, 1, 1]),
+               torch.tensor([30, 30, 30]), torch.tensor([length - 1] * 3))
     with torch.inference_mode():
         program = torch.onnx.export(
             model,
@@ -279,12 +337,12 @@ def export_graph(reference, path: Path) -> None:
             output_names=OUTPUT_NAMES,
             custom_translation_table={torch.ops.decide_onnx.global_attention.default: onnx_global_attention,
                                       torch.ops.decide_onnx.gemm_attention.default: onnx_gemm_attention,
+                                      torch.ops.decide_onnx.packed_attention.default: onnx_packed_attention,
                                       torch.ops.decide_onnx.rotary_embedding.default: onnx_rotary_embedding},
-            dynamic_shapes={
-                "input_ids": {1: torch.export.Dim("length", min=4, max=32768)},
-                "positions": {0: torch.export.Dim("options", min=1, max=4096)},
-                "state_start": None,
-            },
+            dynamic_shapes={"input_ids": {1: length_dim}, "position_ids": {1: length_dim},
+                            "segment_ids": {1: length_dim}, "positions": {0: options_dim},
+                            "questions": {0: options_dim}, "state_starts": {0: options_dim},
+                            "state_ends": {0: options_dim}},
         )
     program.save(str(path))
 
@@ -353,25 +411,55 @@ def store_compact(src: Path, dst: Path) -> None:
     onnx.save_model(model, str(dst))
 
 
+def pack_feed(recs):
+    """The graph inputs for `recs` (verify_prompt records) laid end to end."""
+    ids, position_ids, segment_ids, positions, questions, state_starts, state_ends = [], [], [], [], [], [], []
+    for segment, rec in enumerate(recs):
+        start = len(ids)
+        ids += rec["ids"]
+        position_ids += range(len(rec["ids"]))
+        segment_ids += [segment] * len(rec["ids"])
+        positions += [start + p for p in rec["opt_pos"]]
+        questions += [start + rec["q_pos"]] * len(rec["opt_pos"])
+        state_starts += [start + rec["pool"][0]] * len(rec["opt_pos"])
+        state_ends += [start + rec["pool"][1]] * len(rec["opt_pos"])
+    values = [[ids], [position_ids], [segment_ids], positions, questions, state_starts, state_ends]
+    return {name: np.array(value, np.int64) for name, value in zip(INPUT_NAMES, values)}
+
+
+def reference_logits(reference, rec):
+    with torch.inference_mode():
+        H = reference.encoder(input_ids=torch.tensor([rec["ids"]]),
+                              attention_mask=torch.ones(1, len(rec["ids"]), dtype=torch.long)).last_hidden_state
+        return reference._logits(H, [rec])[0].numpy()
+
+
 def verify_graph(reference, path: Path, tolerance: float) -> None:
-    """Compare ONNX Runtime with the unmodified `DecisionEncoder.forward_recs`; raise on mismatch."""
+    """Compare ONNX Runtime with the unmodified `DecisionEncoder.forward_recs`; raise on mismatch. A pack is also
+    compared with each of its prompts run alone."""
     options = ort.SessionOptions()
     # As the extension runs it: fold the int8 weights into fp32 rather than fusing them into MatMulNBits.
     options.add_session_config_entry("session.disable_quant_qdq", "1")
     session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
     for n, (length, options) in enumerate(VERIFY_CASES):
         rec = verify_prompt(reference, length, options, seed=n)
-        with torch.inference_mode():
-            H = reference.encoder(input_ids=torch.tensor([rec["ids"]]),
-                                  attention_mask=torch.ones(1, len(rec["ids"]), dtype=torch.long)).last_hidden_state
-            expected = reference._logits(H, [rec])[0].numpy()
-        logits = session.run(None, {"input_ids": np.array([rec["ids"]], np.int64),
-                                    "positions": np.array(rec["opt_pos"], np.int64),
-                                    "state_start": np.array([rec["pool"][0]], np.int64)})[0]
+        expected = reference_logits(reference, rec)
+        logits = session.run(None, pack_feed([rec]))[0]
         err = float(np.abs(logits - expected).max())
         print(f"  verify T={len(rec['ids'])} options={options}: max abs logit err {err:.3e}")
         if logits.shape != expected.shape or not err <= tolerance:
             raise SystemExit(f"verification failed for {path.name}: T={len(rec['ids'])}")
+    for n, pack in enumerate(VERIFY_PACKS):
+        recs = [verify_prompt(reference, length, options, seed=100 * n + i) for i, (length, options) in enumerate(pack)]
+        assert all(len(rec["ids"]) <= PACK_PROMPT_MAX for rec in recs)
+        logits = session.run(None, pack_feed(recs))[0]
+        expected = np.concatenate([reference_logits(reference, rec) for rec in recs])
+        alone = np.concatenate([session.run(None, pack_feed([rec]))[0] for rec in recs])
+        err, drift = float(np.abs(logits - expected).max()), float(np.abs(logits - alone).max())
+        print(f"  verify pack of {len(recs)}, T={sum(len(rec['ids']) for rec in recs)}: max abs logit err {err:.3e}, "
+              f"{drift:.3e} from each prompt alone")
+        if logits.shape != expected.shape or not err <= tolerance or not drift <= VERIFY_PACK_DRIFT:
+            raise SystemExit(f"verification failed for {path.name}: pack {n}")
 
 
 def sha256_of(path: Path) -> str:
@@ -422,6 +510,8 @@ static constexpr const ModelFile *MODEL_FILES[] = {{&TOKENIZER_FILE, &ONNX_FILE}
 
 //! `decision.max_len` in config.json: longer prompts are refused, never truncated.
 static constexpr uint64_t CONTEXT_TOKENS = {context_tokens};
+//! The longest prompt that may share a forward pass with others.
+static constexpr uint64_t PACK_PROMPT_TOKENS = {PACK_PROMPT_MAX};
 
 }} // namespace decide_onnx
 }} // namespace duckdb
