@@ -189,8 +189,8 @@ Long prompts cost much more, because 8 of the 24 layers attend over the whole pr
 
 | Prompt tokens | Time | Peak memory of the process |
 |---|---|---|
-| 2,000 | 1.8 s | 2.6 GB |
-| 4,000 | 4.3 s | 3.3 GB |
+| 2,000 | 1.8 s | 2.4 GB |
+| 4,000 | 4.3 s | 3.1 GB |
 | 8,000 | 29 s | 3.2 GB |
 | 16,000 | 104 s | 3.9 GB |
 | 32,000 | 6.5 min | 6.4 GB |
