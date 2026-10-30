@@ -290,8 +290,8 @@ ONNX Runtime (`scripts/parity/make_fixtures.py`):
 ## Building
 
 ```bash
-git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decision-tune
-cd duckdb-decision-tune
+git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decision_tune
+cd duckdb-decision_tune
 git clone https://github.com/microsoft/vcpkg.git ../vcpkg && ../vcpkg/bootstrap-vcpkg.sh
 export VCPKG_TOOLCHAIN_PATH=$PWD/../vcpkg/scripts/buildsystems/vcpkg.cmake
 GEN=ninja make release
