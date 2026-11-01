@@ -66,9 +66,10 @@ from huggingface_hub import snapshot_download
 _S = onnx.defs.OpSchema
 
 
-def contrib_op(name, inputs, attributes):
+def contrib_op(name, inputs, attributes, outputs=("output",)):
     """An ONNX Runtime contrib op, which `onnx` has no schema for: the part of its schema the export uses.
-    `inputs` maps each input to its type ("T": float, "M": int64, "I": int32); a trailing "?" makes it optional."""
+    `inputs` maps each input to its type ("T": float, "M": int64, "I": int32); a trailing "?" makes it optional.
+    With several `outputs`, a call returns one value per output, all float."""
     def parameter(n, t):
         if t.endswith("?"):
             return _S.FormalParameter(n, t[:-1], "", param_option=_S.FormalParameterOption.Optional)
@@ -76,7 +77,7 @@ def contrib_op(name, inputs, attributes):
 
     schema = _S(name, "com.microsoft", 1,
                 inputs=[parameter(n, t) for n, t in inputs.items()],
-                outputs=[_S.FormalParameter("output", "T")],
+                outputs=[_S.FormalParameter(n, "T") for n in outputs],
                 type_constraints=[("T", ["tensor(float)"], ""), ("M", ["tensor(int64)"], ""),
                                   ("I", ["tensor(int32)"], "")],
                 attributes=[_S.Attribute(n, t, "") for n, t in attributes.items()])
