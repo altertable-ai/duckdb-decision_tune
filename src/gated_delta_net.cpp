@@ -1,0 +1,256 @@
+#include "decide_onnx/gated_delta_net.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+// DECIDE_ONNX_USE_MLAS selects MLAS on Apple platforms too, to test that path there.
+#if defined(__APPLE__) && !defined(DECIDE_ONNX_USE_MLAS)
+#define DECIDE_ONNX_ACCELERATE
+#endif
+
+#ifdef DECIDE_ONNX_ACCELERATE
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#else
+// MLAS, ONNX Runtime's linear algebra library, is linked statically with ONNX Runtime; its header is not installed, so
+// third_party/mlas carries the one of the ONNX Runtime version the vcpkg port builds.
+#include "mlas.h"
+#endif
+
+namespace duckdb {
+namespace decide_onnx {
+namespace gated_delta_net {
+
+#ifdef DECIDE_ONNX_ACCELERATE
+static void Gemm(bool trans_a, bool trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda,
+                 const float *b, size_t ldb, float beta, float *c, size_t ldc) {
+	cblas_sgemm(CblasRowMajor, trans_a ? CblasTrans : CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans,
+	            static_cast<__LAPACK_int>(m), static_cast<__LAPACK_int>(n), static_cast<__LAPACK_int>(k), alpha, a,
+	            static_cast<__LAPACK_int>(lda), b, static_cast<__LAPACK_int>(ldb), beta, c,
+	            static_cast<__LAPACK_int>(ldc));
+}
+
+static void Exp(const float *x, float *y, size_t n) {
+	const int count = static_cast<int>(n);
+	vvexpf(y, x, &count);
+}
+#else
+static void Gemm(bool trans_a, bool trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda,
+                 const float *b, size_t ldb, float beta, float *c, size_t ldc) {
+	MlasGemm(trans_a ? CblasTrans : CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans, m, n, k, alpha, a, lda, b, ldb,
+	         beta, c, ldc, nullptr, nullptr);
+}
+
+static void Exp(const float *x, float *y, size_t n) {
+	MlasComputeExp(x, y, n);
+}
+#endif
+
+const Backend &DefaultBackend() {
+	static const Backend backend {Gemm, Exp};
+	return backend;
+}
+
+void Workspace::Reserve(const Shape &shape) {
+	const size_t tokens = shape.tokens, channels = shape.Channels(), heads = shape.heads, chunk = shape.chunk;
+	const size_t key_dim = shape.key_dim, value_dim = shape.value_dim;
+	const size_t padded = (tokens + chunk - 1) / chunk * chunk;
+	conv.resize(padded * channels), decay.resize(padded * heads), beta.resize(padded * heads), row.resize(channels);
+	output.resize(chunk * value_dim);
+	state.resize(key_dim * value_dim);
+	kb.resize(chunk * key_dim), kbd.resize(chunk * key_dim), qd.resize(chunk * key_dim), kd.resize(chunk * key_dim);
+	w.resize(chunk * key_dim), vb.resize(chunk * value_dim), u.resize(chunk * value_dim);
+	a.resize(chunk * chunk), x.resize(chunk * chunk), intra.resize(chunk * chunk), mask.resize(chunk * chunk);
+	cum.resize(chunk), ecum.resize(chunk), elast.resize(chunk);
+}
+
+//! Sum of squares with independent accumulators, so that it vectorizes without -ffast-math.
+static float SumSquares(const float *x, int64_t n) {
+	float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+	int64_t i = 0;
+	for (; i + 8 <= n; i += 8) {
+		for (int64_t j = 0; j < 8; j++) {
+			acc[j] += x[i + j] * x[i + j];
+		}
+	}
+	float sum = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+	for (; i < n; i++) {
+		sum += x[i] * x[i];
+	}
+	return sum;
+}
+
+static float Softplus(float x) {
+	// torch.nn.functional.softplus with beta 1 and threshold 20.
+	return x > 20.0f ? x : std::log1p(std::exp(x));
+}
+
+//! The causal conv and SiLU of every channel, the L2 norms of the q and k heads, and the gates. The rows past the
+//! prompt, up to a whole number of chunks, are zeros: they add nothing to the state and read nothing.
+static void Prepare(const Shape &s, const float *mixed, const float *a, const float *b, const float *taps,
+                    const float *neg_a, const float *dt_bias, Workspace &ws, const Backend &be) {
+	const int64_t tokens = s.tokens, channels = s.Channels(), num_taps = s.taps;
+	const std::vector<float> zeros(channels, 0.0f);
+	std::vector<const float *> rows(num_taps);
+	const float q_scale = 1.0f / std::sqrt(static_cast<float>(s.key_dim));
+	float *scratch = ws.row.data();
+	for (int64_t t = 0; t < tokens; t++) {
+		// The conv reads the current token and the taps - 1 before it; the rows before the prompt are zeros. One pass
+		// over all taps, through restrict pointers so that the compiler keeps the sum in registers.
+		float *__restrict y = ws.conv.data() + t * channels;
+		for (int64_t j = 0; j < num_taps; j++) {
+			const int64_t source = t - (num_taps - 1) + j;
+			rows[j] = source < 0 ? zeros.data() : mixed + source * channels;
+		}
+		if (num_taps == 4) {
+			const float *__restrict x0 = rows[0], *__restrict x1 = rows[1], *__restrict x2 = rows[2],
+			                        *__restrict x3 = rows[3];
+			const float *__restrict w0 = taps, *__restrict w1 = taps + channels, *__restrict w2 = taps + 2 * channels,
+			                        *__restrict w3 = taps + 3 * channels;
+			for (int64_t c = 0; c < channels; c++) {
+				y[c] = (w0[c] * x0[c] + w1[c] * x1[c]) + (w2[c] * x2[c] + w3[c] * x3[c]);
+			}
+		} else {
+			for (int64_t c = 0; c < channels; c++) {
+				float sum = 0.0f;
+				for (int64_t j = 0; j < num_taps; j++) {
+					sum += taps[j * channels + c] * rows[j][c];
+				}
+				y[c] = sum;
+			}
+		}
+		// SiLU: y / (1 + exp(-y)), with the backend's vector exp.
+		for (int64_t c = 0; c < channels; c++) {
+			scratch[c] = -y[c];
+		}
+		be.exp(scratch, scratch, channels);
+		for (int64_t c = 0; c < channels; c++) {
+			y[c] = y[c] / (1.0f + scratch[c]);
+		}
+		// transformers' l2norm (eps 1e-6) on each q and k head; q also takes the key_dim^-0.5 of the delta rule.
+		for (int64_t part = 0; part < 2; part++) {
+			for (int64_t h = 0; h < s.heads; h++) {
+				float *x = y + (part * s.heads + h) * s.key_dim;
+				const float scale = (part == 0 ? q_scale : 1.0f) / std::sqrt(SumSquares(x, s.key_dim) + 1e-6f);
+				for (int64_t d = 0; d < s.key_dim; d++) {
+					x[d] *= scale;
+				}
+			}
+		}
+		for (int64_t h = 0; h < s.heads; h++) {
+			const int64_t i = t * s.heads + h;
+			ws.decay[i] = neg_a[h] * Softplus(a[i] + dt_bias[h]);
+			ws.beta[i] = 1.0f / (1.0f + std::exp(-b[i]));
+		}
+	}
+	std::fill(ws.conv.begin() + tokens * channels, ws.conv.end(), 0.0f);
+	std::fill(ws.decay.begin() + tokens * s.heads, ws.decay.end(), 0.0f);
+	std::fill(ws.beta.begin() + tokens * s.heads, ws.beta.end(), 0.0f);
+}
+
+//! The gated delta rule of head h over the prepared q, k and v, from a zero state, written to its columns of `out`.
+//! Every chunk is a whole one (the last is padded with the zero rows of Prepare), so that every GEMM has the same
+//! shape: a token's output then never depends on the tokens after it, and a prompt in a right-padded batch gets
+//! exactly the values it gets alone.
+static void DeltaRuleHead(const Shape &s, int64_t h, float *out, Workspace &ws, const Backend &be) {
+	const int64_t tokens = s.tokens, heads = s.heads, dk = s.key_dim, dv = s.value_dim;
+	const int64_t ld = s.Channels(), ld_out = heads * dv;
+	const float *q_all = ws.conv.data() + h * dk, *k_all = ws.conv.data() + (heads + h) * dk;
+	const float *v_all = ws.conv.data() + 2 * heads * dk + h * dv;
+	float *state = ws.state.data();
+	std::fill(ws.state.begin(), ws.state.end(), 0.0f);
+	for (int64_t start = 0; start < tokens; start += s.chunk) {
+		const int64_t len = s.chunk, valid = std::min<int64_t>(s.chunk, tokens - start);
+		const float *q = q_all + start * ld, *k = k_all + start * ld, *v = v_all + start * ld;
+		// cum: the decay accumulated from the start of the chunk, in log space.
+		float *cum = ws.cum.data(), *ecum = ws.ecum.data(), *elast = ws.elast.data();
+		float running = 0.0f;
+		for (int64_t i = 0; i < len; i++) {
+			running += ws.decay[(start + i) * heads + h];
+			cum[i] = running;
+		}
+		const float last = cum[len - 1];
+		for (int64_t i = 0; i < len; i++) {
+			elast[i] = last - cum[i];
+		}
+		be.exp(cum, ecum, len);
+		be.exp(elast, elast, len);
+		for (int64_t i = 0; i < len; i++) {
+			const float beta = ws.beta[(start + i) * heads + h];
+			const float *ki = k + i * ld, *qi = q + i * ld, *vi = v + i * ld;
+			float *kb = ws.kb.data() + i * dk, *kbd = ws.kbd.data() + i * dk, *qd = ws.qd.data() + i * dk;
+			float *kd = ws.kd.data() + i * dk, *vb = ws.vb.data() + i * dv;
+			for (int64_t d = 0; d < dk; d++) {
+				kb[d] = ki[d] * beta;
+				kbd[d] = kb[d] * ecum[i];
+				qd[d] = qi[d] * ecum[i];
+				kd[d] = ki[d] * elast[i];
+			}
+			for (int64_t d = 0; d < dv; d++) {
+				vb[d] = vi[d] * beta;
+			}
+		}
+		// A = k_beta k^T for j < i and intra = q k^T for j <= i, each times the decay from token j to token i.
+		float *a = ws.a.data(), *intra = ws.intra.data(), *mask = ws.mask.data();
+		be.gemm(false, true, len, len, dk, 1.0f, ws.kb.data(), dk, k, ld, 0.0f, a, len);
+		be.gemm(false, true, len, len, dk, 1.0f, q, ld, k, ld, 0.0f, intra, len);
+		for (int64_t i = 0; i < len; i++) {
+			float *m = mask + i * len;
+			for (int64_t j = 0; j <= i; j++) {
+				m[j] = cum[i] - cum[j];
+			}
+			be.exp(m, m, i + 1);
+			float *ai = a + i * len, *qi = intra + i * len;
+			for (int64_t j = 0; j < i; j++) {
+				ai[j] *= m[j];
+				qi[j] *= m[j];
+			}
+			qi[i] *= m[i];
+			std::fill(ai + i, ai + len, 0.0f);
+			std::fill(qi + i + 1, qi + len, 0.0f);
+		}
+		// x = (I + A)^-1, row by row: x_i = e_i - sum over m < i of A_im x_m (row m of x is zero past column m).
+		float *x = ws.x.data();
+		for (int64_t i = 0; i < len; i++) {
+			float *xi = x + i * len;
+			std::fill(xi, xi + len, 0.0f);
+			xi[i] = 1.0f;
+			for (int64_t m = 0; m < i; m++) {
+				const float aim = a[i * len + m];
+				const float *xm = x + m * len;
+				for (int64_t j = 0; j <= m; j++) {
+					xi[j] -= aim * xm[j];
+				}
+			}
+		}
+		float *u = ws.u.data(), *w = ws.w.data();
+		be.gemm(false, false, len, dv, len, 1.0f, x, len, ws.vb.data(), dv, 0.0f, u, dv);  // new values
+		be.gemm(false, false, len, dk, len, 1.0f, x, len, ws.kbd.data(), dk, 0.0f, w, dk); // decayed k_beta, solved
+		be.gemm(false, false, len, dv, dk, -1.0f, w, dk, state, dv, 1.0f, u, dv);          // v_new = u - w S
+		float *o = ws.output.data();
+		be.gemm(false, false, len, dv, dk, 1.0f, ws.qd.data(), dk, state, dv, 0.0f, o, dv); // the earlier tokens
+		be.gemm(false, false, len, dv, len, 1.0f, intra, len, u, dv, 1.0f, o, dv);          // this chunk
+		for (int64_t i = 0; i < valid; i++) {
+			std::copy(o + i * dv, o + (i + 1) * dv, out + (start + i) * ld_out + h * dv);
+		}
+		for (int64_t i = 0; i < dk * dv; i++) {
+			state[i] *= ecum[len - 1];
+		}
+		be.gemm(true, false, dk, dv, len, 1.0f, ws.kd.data(), dk, u, dv, 1.0f, state, dv); // S += k_d^T v_new
+	}
+}
+
+void Mixer(const Shape &shape, const float *mixed_qkv, const float *a, const float *b, const float *taps,
+           const float *neg_a, const float *dt_bias, float *out, Workspace &workspace, const Backend &backend) {
+	workspace.Reserve(shape);
+	Prepare(shape, mixed_qkv, a, b, taps, neg_a, dt_bias, workspace, backend);
+	for (int64_t h = 0; h < shape.heads; h++) {
+		DeltaRuleHead(shape, h, out, workspace, backend);
+	}
+}
+
+} // namespace gated_delta_net
+} // namespace decide_onnx
+} // namespace duckdb

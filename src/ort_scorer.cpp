@@ -1,5 +1,7 @@
 #include "decide_onnx/scorer.hpp"
 
+#include "decide_onnx/custom_ops.hpp"
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #ifdef _WIN32
@@ -35,6 +37,8 @@ OrtScorer::OrtScorer(const string &onnx_path) : impl(make_uniq<Impl>()) {
 		// The weights ship as int8 DequantizeLinear initializers. Without this, ONNX Runtime fuses them into
 		// MatMulNBits, several times slower on CPU; with it, constant folding turns them back into fp32 at load.
 		options.AddConfigEntry("session.disable_quant_qdq", "1");
+		// The extension's own kernels (decide_onnx.GatedDeltaNetMixer), for graphs that use them.
+		AddCustomOps(options);
 #ifdef _WIN32
 		auto wide_path = WindowsUtil::UTF8ToUnicode(onnx_path.c_str());
 		impl->session = make_uniq<Ort::Session>(SharedEnv(), wide_path.c_str(), options);

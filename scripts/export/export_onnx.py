@@ -66,22 +66,23 @@ from huggingface_hub import snapshot_download
 _S = onnx.defs.OpSchema
 
 
-def contrib_op(name, inputs, attributes, outputs=("output",)):
+def contrib_op(name, inputs, attributes, outputs=("output",), domain="com.microsoft"):
     """An ONNX Runtime contrib op, which `onnx` has no schema for: the part of its schema the export uses.
     `inputs` maps each input to its type ("T": float, "M": int64, "I": int32); a trailing "?" makes it optional.
-    With several `outputs`, a call returns one value per output, all float."""
+    With several `outputs`, a call returns one value per output, all float. `domain` also serves the extension's own
+    custom ops."""
     def parameter(n, t):
         if t.endswith("?"):
             return _S.FormalParameter(n, t[:-1], "", param_option=_S.FormalParameterOption.Optional)
         return _S.FormalParameter(n, t)
 
-    schema = _S(name, "com.microsoft", 1,
+    schema = _S(name, domain, 1,
                 inputs=[parameter(n, t) for n, t in inputs.items()],
                 outputs=[_S.FormalParameter(n, "T") for n in outputs],
                 type_constraints=[("T", ["tensor(float)"], ""), ("M", ["tensor(int64)"], ""),
                                   ("I", ["tensor(int32)"], "")],
                 attributes=[_S.Attribute(n, t, "") for n, t in attributes.items()])
-    return onnxscript.values.Op(onnxscript.values.Opset("com.microsoft", 1), name, schema)
+    return onnxscript.values.Op(onnxscript.values.Opset(domain, 1), name, schema)
 
 
 MULTI_HEAD_ATTENTION = contrib_op("MultiHeadAttention",

@@ -84,3 +84,25 @@ run: the extension refuses files whose SHA-256 differs from the header. The weig
 3. Upload the release in `out/` to `https://assets.altertable.ai/decide_onnx/<ASSET_VERSION>/`: `model.onnx`,
    `tokenizer.json`, `manifest.json` and the weights' `LICENSE` (not `model_fp32.onnx`). The weights are Apache-2.0, and the licence must
    stay next to them.
+
+## OneJev1.6-0.8B (candidate)
+
+`export_onejev.py` exports the text decoder of [OmniJev/OneJev1.6-0.8B](https://huggingface.co/OmniJev/OneJev1.6-0.8B),
+a multilingual candidate to replace vela3-fast; its docstring describes the graph. The extension does not run it yet.
+It writes `out/onejev/`: `model_fp32.onnx` and `model.onnx` (int8 projections), on ONNX Runtime's own kernels.
+
+```bash
+uv run python -I export_onejev.py
+```
+
+With `--fused-mixer`, it also writes `model_fused_fp32.onnx` and `model_fused.onnx`, whose 18 Gated DeltaNet layers
+are one `decide_onnx.GatedDeltaNetMixer` node each: the extension's own CPU kernel (`src/gated_delta_net.cpp`,
+registered by `src/custom_ops.cpp`). ONNX Runtime's CPU `LinearAttention` runs the delta rule token by token; the
+kernel runs it in chunks of 64 tokens on GEMMs (Accelerate on Apple platforms, ONNX Runtime's MLAS elsewhere), with
+the causal conv, the L2 norms and the gates in one pass. Python's onnxruntime loads it from a library that
+`custom_ops/build.sh` builds from the same sources, after `make release`:
+
+```bash
+sh custom_ops/build.sh            # MLAS=1 builds the MLAS backend on Apple platforms too
+uv run python -I export_onejev.py --fused-mixer out/libdecide_onnx_ops.dylib
+```

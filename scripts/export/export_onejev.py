@@ -31,7 +31,12 @@ projections in fp32 gave 214 for about 13% more time.
 Both graphs are checked against the unmodified transformers model (PyTorch, fp32), prompt by prompt. Outputs land in
 `out/onejev/`: model_fp32.onnx (with its external data) and model.onnx.
 
-Usage: uv run python -I export_onejev.py [--out out/onejev] [--skip-export]
+With --fused-mixer, it also writes graphs whose Gated DeltaNet layers are one `decide_onnx.GatedDeltaNetMixer` node each:
+the extension's own CPU kernel (src/gated_delta_net.cpp), which runs the conv, norms and gates in one pass and the
+delta rule in chunks of 64 tokens on GEMMs. ONNX Runtime's CPU LinearAttention runs the delta rule token by token.
+Python's onnxruntime loads the kernel from the library custom_ops/build.sh builds.
+
+Usage: uv run python -I export_onejev.py [--out out/onejev] [--skip-export] [--fused-mixer out/libdecide_onnx_ops.dylib]
 """
 
 import argparse
@@ -78,6 +83,11 @@ LINEAR_ATTENTION = contrib_op("LinearAttention",
                               {"q_num_heads": _S.AttrType.INT, "kv_num_heads": _S.AttrType.INT,
                                "update_rule": _S.AttrType.STRING},
                               outputs=("output", "present_state"))
+# The extension's fused Gated DeltaNet token mixer (src/include/decide_onnx/gated_delta_net.hpp).
+CUSTOM_DOMAIN = "decide_onnx"
+GATED_DELTA_NET_MIXER = contrib_op("GatedDeltaNetMixer",
+                                   {"mixed_qkv": "T", "a": "T", "b": "T", "taps": "T", "neg_a": "T", "dt_bias": "T"},
+                                   {}, domain=CUSTOM_DOMAIN)
 
 
 def load_reference():
@@ -183,11 +193,38 @@ def causal_conv_silu(x, taps):
     return F.silu(y)
 
 
+def mixer(mixed_qkv, a, b, taps, neg_a, dt_bias, heads: int):
+    """A Gated DeltaNet layer between its input projection and its gated norm: the causal conv and SiLU of the
+    [B, T, C] projection, the L2-normalized q and k, the decay and beta gates, and the delta rule -> [B, T, H * Dv]."""
+    key_dim = value_dim = mixed_qkv.shape[-1] // (3 * heads) * heads
+    q, k, v = causal_conv_silu(mixed_qkv, taps).split([key_dim, key_dim, value_dim], dim=-1)
+    decay = neg_a * F.softplus(a + dt_bias)
+    return gated_delta_rule(l2_normalize(q, heads), l2_normalize(k, heads), v, decay, b.sigmoid(), heads)
+
+
+@torch.library.custom_op("onejev::gated_delta_net_mixer", mutates_args=())
+def gated_delta_net_mixer(mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor, taps: torch.Tensor,
+                          neg_a: torch.Tensor, dt_bias: torch.Tensor, heads: int) -> torch.Tensor:
+    """`mixer` as one op. Exported as decide_onnx.GatedDeltaNetMixer, the extension's fused CPU kernel: the conv, norms
+    and gates in one pass, and the delta rule in chunks of 64 tokens on GEMMs."""
+    return mixer(mixed_qkv, a, b, taps, neg_a, dt_bias, heads)
+
+
+@gated_delta_net_mixer.register_fake
+def _(mixed_qkv, a, b, taps, neg_a, dt_bias, heads):
+    return mixed_qkv.new_empty(mixed_qkv.shape[0], mixed_qkv.shape[1], mixed_qkv.shape[2] // 3)
+
+
+def onnx_gated_delta_net_mixer(mixed_qkv, a, b, taps, neg_a, dt_bias, heads: int):
+    return GATED_DELTA_NET_MIXER(mixed_qkv, a, b, taps, neg_a, dt_bias)
+
+
 class Decoder(torch.nn.Module):
     """OneJev's text decoder and letter readout on concatenated copies of the reference weights."""
 
-    def __init__(self, model, slots: list[int]):
+    def __init__(self, model, slots: list[int], fused_mixer: bool = False):
         super().__init__()
+        self.fused_mixer = fused_mixer
         lm = model.model.language_model
         cfg = self.config = lm.config
         self.eps = cfg.rms_norm_eps
@@ -253,9 +290,8 @@ class Decoder(torch.nn.Module):
             if spec["type"] == "linear_attention":
                 heads, key_dim, value_dim = spec["heads"], spec["key_dim"], spec["value_dim"]
                 qkv, z, b, a = (x @ spec["proj"]).split([2 * key_dim + value_dim, value_dim, heads, heads], dim=-1)
-                q, k, v = causal_conv_silu(qkv, spec["taps"]).split([key_dim, key_dim, value_dim], dim=-1)
-                decay = spec["neg_a"] * F.softplus(a + spec["dt_bias"])
-                out = gated_delta_rule(l2_normalize(q, heads), l2_normalize(k, heads), v, decay, b.sigmoid(), heads)
+                mix = gated_delta_net_mixer if self.fused_mixer else mixer
+                out = mix(qkv, a, b, spec["taps"], spec["neg_a"], spec["dt_bias"], heads)
                 out = rms_norm(out.reshape(batch, length, heads, -1), spec["out_norm"], self.eps)
                 out = (out * F.silu(z.reshape(batch, length, heads, -1))).reshape(batch, length, -1)
             else:
@@ -278,8 +314,8 @@ class Decoder(torch.nn.Module):
         return rms_norm(h, self.final_norm, self.eps) @ self.slot_rows
 
 
-def export_graph(model, slots, path: Path) -> None:
-    decoder = Decoder(model, slots).eval()
+def export_graph(model, slots, path: Path, fused_mixer: bool = False) -> None:
+    decoder = Decoder(model, slots, fused_mixer).eval()
     batch_dim = torch.export.Dim("batch", min=1, max=1024)
     length_dim = torch.export.Dim("length", min=2, max=262144)
     example = (torch.randint(100, 40000, (2, 70)), torch.tensor([70, 50]))
@@ -288,7 +324,8 @@ def export_graph(model, slots, path: Path) -> None:
             decoder, example, dynamo=True, opset_version=21, input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
             custom_translation_table={torch.ops.onejev.rotary_embedding.default: onnx_rotary_embedding,
                                       torch.ops.onejev.causal_attention.default: onnx_causal_attention,
-                                      torch.ops.onejev.gated_delta_rule.default: onnx_gated_delta_rule},
+                                      torch.ops.onejev.gated_delta_rule.default: onnx_gated_delta_rule,
+                                      torch.ops.onejev.gated_delta_net_mixer.default: onnx_gated_delta_net_mixer},
             dynamic_shapes={"input_ids": {0: batch_dim, 1: length_dim}, "lengths": {0: batch_dim}},
             external_data=True,
         )
@@ -334,17 +371,20 @@ def batch_feed(prompts, pad_id):
     return {"input_ids": ids, "lengths": np.array([len(p) for p in prompts], np.int64)}
 
 
-def make_session(path: Path, threads: int = 0):
+def make_session(path: Path, threads: int = 0, custom_ops: Path | None = None):
+    """A CPU session; `custom_ops` is the library of the extension's ops (custom_ops/build.sh), for fused graphs."""
     options = ort.SessionOptions()
     options.intra_op_num_threads = threads
     options.add_session_config_entry("session.disable_quant_qdq", "1")
+    if custom_ops is not None:
+        options.register_custom_ops_library(str(custom_ops))
     return ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
 
 
-def verify_graph(model, tokenizer, slots, path: Path, tolerance: float) -> None:
+def verify_graph(model, tokenizer, slots, path: Path, tolerance: float, custom_ops: Path | None = None) -> None:
     """Compare ONNX Runtime with the unmodified transformers model, prompt by prompt; then the short prompts as one
     right-padded batch against each alone. Raise on mismatch."""
-    session = make_session(path)
+    session = make_session(path, custom_ops=custom_ops)
     prompts = verify_prompts(tokenizer)
     alone = []
     for ids in prompts:
@@ -424,9 +464,9 @@ def store_int8(src: Path, dst: Path, keep_fp32_inputs: tuple[int, ...] = ()) -> 
     onnx.save_model(model, str(dst))
 
 
-def benchmark(path: Path, tokenizer) -> None:
+def benchmark(path: Path, tokenizer, custom_ops: Path | None = None) -> None:
     """One thread: one prompt alone, and the ten verification chat prompts as one batch."""
-    session = make_session(path, threads=1)
+    session = make_session(path, threads=1, custom_ops=custom_ops)
     prompts = verify_prompts(tokenizer)[:len(VERIFY_STATES) * len(VERIFY_QUESTIONS)]
     for label, feed in [(f"one prompt, T={len(prompts[0])}", batch_feed(prompts[:1], tokenizer.pad_token_id)),
                         (f"batch of {len(prompts)}, T={max(map(len, prompts))}", batch_feed(prompts, tokenizer.pad_token_id))]:
@@ -442,6 +482,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "out" / "onejev")
     parser.add_argument("--skip-export", action="store_true", help="reuse model_fp32.onnx")
+    parser.add_argument("--fused-mixer", type=Path, metavar="LIBRARY",
+                        help="also write model_fused_fp32.onnx and model_fused.onnx, whose Gated DeltaNet layers run "
+                             "the extension's decide_onnx.GatedDeltaNetMixer, and check them with LIBRARY "
+                             "(out/libdecide_onnx_ops.*, from custom_ops/build.sh)")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -458,6 +502,15 @@ def main() -> None:
     store_int8(fp32_path, onnx_path)
     verify_graph(model, tokenizer, slots, onnx_path, VERIFY_INT8_TOLERANCE)
     benchmark(onnx_path, tokenizer)
+    if args.fused_mixer:
+        print("exporting with the fused Gated DeltaNet mixer")
+        fused_fp32, fused = args.out / "model_fused_fp32.onnx", args.out / "model_fused.onnx"
+        if not args.skip_export:
+            export_graph(model, slots, fused_fp32, fused_mixer=True)
+        verify_graph(model, tokenizer, slots, fused_fp32, VERIFY_TOLERANCE, args.fused_mixer)
+        store_int8(fused_fp32, fused)
+        verify_graph(model, tokenizer, slots, fused, VERIFY_INT8_TOLERANCE, args.fused_mixer)
+        benchmark(fused, tokenizer, args.fused_mixer)
     print(f"wrote {args.out}")
 
 

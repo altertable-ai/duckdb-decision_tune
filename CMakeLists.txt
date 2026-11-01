@@ -34,10 +34,11 @@ set(EXTENSION_SOURCES
     src/model_store.cpp
     src/state_text.cpp
     src/tokenizer.cpp)
-# This file includes onnxruntime headers. Skip it when the tidy job has no ONNX
-# Runtime.
+# These files include onnxruntime (or MLAS) headers. Skip them when the tidy job
+# has no ONNX Runtime.
 if(onnxruntime_FOUND)
-  list(APPEND EXTENSION_SOURCES src/ort_scorer.cpp)
+  list(APPEND EXTENSION_SOURCES src/ort_scorer.cpp src/custom_ops.cpp
+       src/gated_delta_net.cpp)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -52,6 +53,16 @@ if(onnxruntime_FOUND)
     target_include_directories(${_target}
                                PRIVATE ${DECIDE_ONNX_ORT_INCLUDE_DIR})
     target_link_libraries(${_target} onnxruntime::onnxruntime)
+    # The Gated DeltaNet kernel (src/gated_delta_net.cpp) runs on Accelerate on
+    # Apple platforms and on ONNX Runtime's MLAS elsewhere, whose header ONNX
+    # Runtime does not install (see third_party/mlas).
+    if(APPLE)
+      target_link_libraries(${_target} "-framework Accelerate")
+    else()
+      target_include_directories(
+        ${_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mlas)
+      target_link_libraries(${_target} onnxruntime::onnxruntime_mlas)
+    endif()
   endforeach()
 endif()
 # SHA-256 comes from DuckDB's bundled mbedtls (as in httpfs), JSON parsing from
