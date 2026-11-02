@@ -3,11 +3,11 @@
 namespace duckdb {
 class ExtensionLoader;
 
-namespace decision_tune {
+namespace decide_onnx {
 
 //! Registers `decision_choose(state, question, options)`, `decision_yes_no(state, question)` and
-//! `decision_tune_tokenize(text)`.
+//! `decide_onnx_tokenize(text)`.
 void RegisterDecideFunctions(ExtensionLoader &loader);
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

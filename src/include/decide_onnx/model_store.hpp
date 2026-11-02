@@ -1,17 +1,17 @@
 #pragma once
 
-#include "decision_tune/decision_model.hpp"
+#include "decide_onnx/decision_model.hpp"
 
 #include "duckdb.hpp"
 
 namespace duckdb {
 class ExtensionLoader;
 
-namespace decision_tune {
+namespace decide_onnx {
 
 struct ModelFile;
 
-//! Resolves, downloads, verifies and caches the DecisionTune files, and keeps one tokenizer and one ONNX Runtime
+//! Resolves, downloads, verifies and caches the vela3-fast files, and keeps one tokenizer and one ONNX Runtime
 //! session per model directory for the whole process.
 class ModelStore {
 public:
@@ -19,8 +19,8 @@ public:
 
 	//! The tokenizer alone (only `tokenizer.json` is needed).
 	shared_ptr<BpeTokenizer> GetTokenizer(ClientContext &context);
-	//! The model: `decision_tune_model_path` if set, otherwise the cached files (downloaded into
-	//! `decision_tune_cache_dir` from `decision_tune_model_url` if missing). Cached and downloaded files are checked
+	//! The model: `decide_onnx_model_path` if set, otherwise the cached files (downloaded into
+	//! `decide_onnx_cache_dir` from `decide_onnx_model_url` if missing). Cached and downloaded files are checked
 	//! against the SHA-256 in the release manifest.
 	shared_ptr<DecisionModel> GetModel(ClientContext &context);
 
@@ -39,7 +39,7 @@ private:
 		shared_ptr<DecisionModel> model;
 	};
 	struct Location {
-		//! The directory the files are read from: the cache or `decision_tune_model_path`.
+		//! The directory the files are read from: the cache or `decide_onnx_model_path`.
 		string directory;
 		bool explicit_path = false;
 	};
@@ -56,8 +56,8 @@ private:
 	unordered_map<string, shared_ptr<ModelRecord>> models;
 };
 
-//! Registers the `decision_tune_*` settings and the `decision_tune_models()` table function.
+//! Registers the `decide_onnx_*` settings and the `decide_onnx_models()` table function.
 void RegisterModelStore(ExtensionLoader &loader);
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

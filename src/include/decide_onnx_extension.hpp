@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class DecisionTuneExtension : public Extension {
+class DecideOnnxExtension : public Extension {
 public:
 	void Load(ExtensionLoader &db) override;
 	std::string Name() override;

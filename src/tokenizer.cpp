@@ -1,4 +1,4 @@
-#include "decision_tune/tokenizer.hpp"
+#include "decide_onnx/tokenizer.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -11,7 +11,7 @@
 #include <queue>
 
 namespace duckdb {
-namespace decision_tune {
+namespace decide_onnx {
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -94,11 +94,38 @@ static int32_t ByteToCodepoint(uint8_t byte) {
 	return 256 + n;
 }
 
+//! The code point at `text[pos]`; throws on invalid UTF-8.
+static int32_t NextCodepoint(const char *text, idx_t size, idx_t pos, idx_t &length) {
+	int32_t cp;
+	auto result = utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t *>(text + pos),
+	                               NumericCast<utf8proc_ssize_t>(size - pos), &cp);
+	if (result <= 0) {
+		throw InvalidInputException("decide_onnx: invalid UTF-8 in the text");
+	}
+	length = NumericCast<idx_t>(result);
+	return cp;
+}
+
+//! Where the whitespace at the end of `text` starts (`size` if there is none).
+static idx_t TrailingSpaceStart(const char *text, idx_t size) {
+	idx_t start = 0;
+	idx_t pos = 0;
+	while (pos < size) {
+		idx_t length;
+		auto space = IsSpace(NextCodepoint(text, size, pos, length));
+		pos += length;
+		if (!space) {
+			start = pos;
+		}
+	}
+	return start;
+}
+
 static string CodepointToUtf8(int32_t cp) {
 	char buffer[4];
 	int size;
 	if (!Utf8Proc::CodepointToUtf8(cp, size, buffer)) {
-		throw InternalException("decision_tune: invalid code point %d", cp);
+		throw InternalException("decide_onnx: invalid code point %d", cp);
 	}
 	return string(buffer, NumericCast<idx_t>(size));
 }
@@ -108,14 +135,14 @@ static string CodepointToUtf8(int32_t cp) {
 //===--------------------------------------------------------------------===//
 static string JsonString(yyjson_val *val, const string &what, const string &source_name) {
 	if (!yyjson_is_str(val)) {
-		throw IOException("decision_tune: %s in '%s' is not a string", what, source_name);
+		throw IOException("decide_onnx: %s in '%s' is not a string", what, source_name);
 	}
 	return string(yyjson_get_str(val), yyjson_get_len(val));
 }
 
 static int64_t JsonId(yyjson_val *val, const string &what, const string &source_name) {
 	if (!yyjson_is_int(val) || yyjson_get_sint(val) < 0 || yyjson_get_sint(val) > NumericLimits<int32_t>::Maximum()) {
-		throw IOException("decision_tune: %s in '%s' is not a token id", what, source_name);
+		throw IOException("decide_onnx: %s in '%s' is not a token id", what, source_name);
 	}
 	return yyjson_get_sint(val);
 }
@@ -124,36 +151,40 @@ static void ExpectType(yyjson_val *root, const char *key, const char *expected, 
 	auto object = yyjson_obj_get(root, key);
 	auto type = object ? yyjson_obj_get(object, "type") : nullptr;
 	if (!type || !yyjson_is_str(type) || strcmp(yyjson_get_str(type), expected) != 0) {
-		throw IOException("decision_tune: '%s' is not a DecisionTune tokenizer (%s must be of type %s)", source_name,
-		                  key, expected);
+		throw IOException("decide_onnx: '%s' is not a vela3-fast tokenizer (%s must be of type %s)", source_name, key,
+		                  expected);
 	}
 }
 
 BpeTokenizer::BpeTokenizer(const string &json, const string &source_name) {
 	auto doc = yyjson_read(json.data(), json.size(), YYJSON_READ_NOFLAG);
 	if (!doc) {
-		throw IOException("decision_tune: '%s' is not valid JSON", source_name);
+		throw IOException("decide_onnx: '%s' is not valid JSON", source_name);
 	}
 	try {
 		auto root = yyjson_doc_get_root(doc);
 		ExpectType(root, "model", "BPE", source_name);
-		ExpectType(root, "normalizer", "NFC", source_name);
+		auto normalizer = yyjson_obj_get(root, "normalizer");
+		nfc = normalizer && !yyjson_is_null(normalizer);
+		if (nfc) {
+			ExpectType(root, "normalizer", "NFC", source_name);
+		}
 		ExpectType(root, "pre_tokenizer", "ByteLevel", source_name);
 		auto pre_tokenizer = yyjson_obj_get(root, "pre_tokenizer");
 		if (yyjson_get_bool(yyjson_obj_get(pre_tokenizer, "add_prefix_space")) ||
 		    !yyjson_get_bool(yyjson_obj_get(pre_tokenizer, "use_regex"))) {
-			throw IOException("decision_tune: '%s' uses an unsupported ByteLevel pre-tokenizer configuration",
+			throw IOException("decide_onnx: '%s' uses an unsupported ByteLevel pre-tokenizer configuration",
 			                  source_name);
 		}
 		auto model = yyjson_obj_get(root, "model");
 		auto dropout = yyjson_obj_get(model, "dropout");
 		if ((dropout && !yyjson_is_null(dropout)) || yyjson_get_bool(yyjson_obj_get(model, "byte_fallback"))) {
-			throw IOException("decision_tune: '%s' uses an unsupported BPE configuration", source_name);
+			throw IOException("decide_onnx: '%s' uses an unsupported BPE configuration", source_name);
 		}
 
 		auto vocab_json = yyjson_obj_get(model, "vocab");
 		if (!yyjson_is_obj(vocab_json)) {
-			throw IOException("decision_tune: '%s' has no BPE vocabulary", source_name);
+			throw IOException("decide_onnx: '%s' has no BPE vocabulary", source_name);
 		}
 		yyjson_obj_iter vocab_iter;
 		yyjson_obj_iter_init(vocab_json, &vocab_iter);
@@ -169,13 +200,12 @@ BpeTokenizer::BpeTokenizer(const string &json, const string &source_name) {
 
 		auto merges_json = yyjson_obj_get(model, "merges");
 		if (!yyjson_is_arr(merges_json)) {
-			throw IOException("decision_tune: '%s' has no BPE merges", source_name);
+			throw IOException("decide_onnx: '%s' has no BPE merges", source_name);
 		}
 		auto lookup = [&](const string &token) {
 			auto entry = vocab.find(token);
 			if (entry == vocab.end()) {
-				throw IOException("decision_tune: merge token '%s' is not in the vocabulary of '%s'", token,
-				                  source_name);
+				throw IOException("decide_onnx: merge token '%s' is not in the vocabulary of '%s'", token, source_name);
 			}
 			return entry->second;
 		};
@@ -192,7 +222,7 @@ BpeTokenizer::BpeTokenizer(const string &json, const string &source_name) {
 				auto text = JsonString(merge, "a merge", source_name);
 				auto space = text.find(' ');
 				if (space == string::npos) {
-					throw IOException("decision_tune: invalid merge '%s' in '%s'", text, source_name);
+					throw IOException("decide_onnx: invalid merge '%s' in '%s'", text, source_name);
 				}
 				left = text.substr(0, space);
 				right = text.substr(space + 1);
@@ -208,12 +238,13 @@ BpeTokenizer::BpeTokenizer(const string &json, const string &source_name) {
 			yyjson_arr_iter_init(added_json, &added_iter);
 			while (auto token = yyjson_arr_iter_next(&added_iter)) {
 				AddedToken added {JsonString(yyjson_obj_get(token, "content"), "an added token", source_name),
-				                  JsonId(yyjson_obj_get(token, "id"), "an added token id", source_name)};
+				                  JsonId(yyjson_obj_get(token, "id"), "an added token id", source_name),
+				                  yyjson_get_bool(yyjson_obj_get(token, "lstrip")),
+				                  yyjson_get_bool(yyjson_obj_get(token, "rstrip"))};
 				if (added.content.empty()) {
 					continue;
 				}
 				added_ids[added.content] = added.id;
-				// The `[MASK]` lstrip flag only matters for text that holds `[MASK]`, which the prompt never does.
 				if (yyjson_get_bool(yyjson_obj_get(token, "normalized"))) {
 					normalized_added_tokens.push_back(std::move(added));
 				} else {
@@ -235,7 +266,7 @@ int64_t BpeTokenizer::TokenId(const string &token) const {
 	}
 	auto entry = vocab.find(token);
 	if (entry == vocab.end()) {
-		throw IOException("decision_tune: the tokenizer has no token '%s'", token);
+		throw IOException("decide_onnx: the tokenizer has no token '%s'", token);
 	}
 	return entry->second;
 }
@@ -251,9 +282,14 @@ std::vector<int64_t> BpeTokenizer::Encode(const string &text) const {
 }
 
 void BpeTokenizer::EncodeNormalized(const char *text, idx_t size, std::vector<int64_t> &ids) const {
+	if (!nfc) {
+		SplitOnAddedTokens(text, size, normalized_added_tokens, ids,
+		                   [&](const char *piece, idx_t piece_size) { EncodePreTokenized(piece, piece_size, ids); });
+		return;
+	}
 	auto normalized = Utf8Proc::Normalize(text, size);
 	if (!normalized) {
-		throw InvalidInputException("decision_tune: could not normalize the text to Unicode NFC");
+		throw InvalidInputException("decide_onnx: could not normalize the text to Unicode NFC");
 	}
 	string owned(normalized);
 	free(normalized);
@@ -280,11 +316,21 @@ void BpeTokenizer::SplitOnAddedTokens(const char *text, idx_t size, const std::v
 			pos++;
 			continue;
 		}
-		if (pos > segment_start) {
-			on_text(text + segment_start, pos - segment_start);
+		// lstrip / rstrip: the token also takes the whitespace before / after it.
+		auto text_end =
+		    best->lstrip ? segment_start + TrailingSpaceStart(text + segment_start, pos - segment_start) : pos;
+		if (text_end > segment_start) {
+			on_text(text + segment_start, text_end - segment_start);
 		}
 		ids.push_back(best->id);
 		pos += best->content.size();
+		while (best->rstrip && pos < size) {
+			idx_t length;
+			if (!IsSpace(NextCodepoint(text, size, pos, length))) {
+				break;
+			}
+			pos += length;
+		}
 		segment_start = pos;
 	}
 	if (size > segment_start) {
@@ -300,16 +346,12 @@ void BpeTokenizer::EncodePreTokenized(const char *text, idx_t size, std::vector<
 	std::vector<idx_t> offsets;
 	idx_t pos = 0;
 	while (pos < size) {
-		int32_t cp;
-		auto length = utf8proc_iterate(reinterpret_cast<const utf8proc_uint8_t *>(text + pos),
-		                               NumericCast<utf8proc_ssize_t>(size - pos), &cp);
-		if (length <= 0) {
-			throw InvalidInputException("decision_tune: invalid UTF-8 in the text");
-		}
+		idx_t length;
+		auto cp = NextCodepoint(text, size, pos, length);
 		cps.push_back(cp);
 		classes.push_back(Classify(cp));
 		offsets.push_back(pos);
-		pos += NumericCast<idx_t>(length);
+		pos += length;
 	}
 	offsets.push_back(size);
 	auto n = cps.size();
@@ -377,7 +419,7 @@ void BpeTokenizer::EncodeWord(const char *word, idx_t size, std::vector<int64_t>
 	for (idx_t i = 0; i < size; i++) {
 		auto id = byte_ids[static_cast<uint8_t>(word[i])];
 		if (id < 0) {
-			throw InvalidInputException("decision_tune: byte 0x%02x is not in the tokenizer vocabulary",
+			throw InvalidInputException("decide_onnx: byte 0x%02x is not in the tokenizer vocabulary",
 			                            static_cast<uint8_t>(word[i]));
 		}
 		symbols[i] = Symbol {id, static_cast<int64_t>(i) - 1, i + 1 < size ? static_cast<int64_t>(i + 1) : -1, true};
@@ -426,5 +468,5 @@ void BpeTokenizer::EncodeWord(const char *word, idx_t size, std::vector<int64_t>
 	}
 }
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

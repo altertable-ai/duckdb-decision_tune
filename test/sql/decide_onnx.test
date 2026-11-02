@@ -1,20 +1,22 @@
-# name: test/sql/decision_tune.test
+# name: test/sql/decide_onnx.test
 # description: the extension loads, links ONNX Runtime and checks its inputs before touching the model
 # group: [sql]
 
-require decision_tune
+require decide_onnx
 
 query II
-SELECT decision_tune_version().onnxruntime LIKE '1.%', decision_tune_version().model;
+SELECT decide_onnx_version().onnxruntime LIKE '1.%', decide_onnx_version().model;
 ----
-true	DecisionTune 1.0
+true	vela3-fast
 
+# (local_path uses the platform's separator: \ on Windows)
 query IIII
-SELECT file_name, file_bytes, url LIKE 'https://huggingface.co/decision-tune/decisiontune-1.0/resolve/%', local_path LIKE '%' || file_name
-FROM decision_tune_models() ORDER BY file_name;
+SELECT file_name, file_bytes > 0, url = 'https://assets.altertable.ai/decide_onnx/v5/' || file_name,
+       replace(local_path, '\', '/') LIKE '%/decide_onnx/v5/' || file_name
+FROM decide_onnx_models() ORDER BY file_name;
 ----
-model.onnx	1579877218	true	true
-tokenizer.json	3583228	true	true
+model.onnx	true	true	true
+tokenizer.json	true	true	true
 
 query I
 SELECT typeof(decision_choose('x', 'q', ['a', 'b']));
@@ -53,7 +55,7 @@ SELECT decision_choose('x', 'q', MAP {'': 'empty'});
 a decision needs at least 2 options
 
 statement ok
-SET decision_tune_model_path = '/definitely/not/a/directory';
+SET decide_onnx_model_path = '/definitely/not/a/directory';
 
 statement error
 SELECT decision_yes_no('x', 'q');
@@ -61,7 +63,7 @@ SELECT decision_yes_no('x', 'q');
 is not a directory
 
 statement ok
-RESET decision_tune_model_path;
+RESET decide_onnx_model_path;
 
 # The DECIDE clause is checked when it is parsed
 statement ok

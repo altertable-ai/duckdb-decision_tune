@@ -7,7 +7,7 @@ if(CMAKE_CXX_STANDARD LESS 17)
     set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
 endif()
 
-duckdb_extension_load(decision_tune
+duckdb_extension_load(decide_onnx
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     LOAD_TESTS
 )

@@ -7,11 +7,12 @@
 #include <vector>
 
 namespace duckdb {
-namespace decision_tune {
+namespace decide_onnx {
 
-//! The byte-level BPE tokenizer of DecisionTune 1.0 (ModernBERT's), read from its Hugging Face `tokenizer.json`.
-//! A C++ port of the subset of `tokenizers` this file uses: added tokens (special ones matched on the raw text,
-//! the others after normalization), NFC normalization, the GPT-2 ByteLevel pre-tokenizer and BPE. Thread-safe.
+//! The byte-level BPE tokenizer of vela3-fast (UltraBERT's), read from its Hugging Face `tokenizer.json`.
+//! A C++ port of the subset of `tokenizers` such files use: added tokens (special ones matched on the raw text,
+//! the others after normalization; lstrip and rstrip), no or NFC normalization, the GPT-2 ByteLevel pre-tokenizer
+//! and BPE. Thread-safe.
 class BpeTokenizer {
 public:
 	//! Parses the contents of a `tokenizer.json`. Throws IOException if it is not the expected kind of tokenizer.
@@ -26,13 +27,15 @@ private:
 	struct AddedToken {
 		string content;
 		int64_t id;
+		bool lstrip;
+		bool rstrip;
 	};
 	struct Merge {
 		uint32_t rank;
 		int64_t id;
 	};
 
-	//! Appends the ids of `text` (no added tokens in it) after NFC normalization and normalized added-token splits.
+	//! Appends the ids of `text` (no added tokens in it) after normalization and normalized added-token splits.
 	void EncodeNormalized(const char *text, idx_t size, std::vector<int64_t> &ids) const;
 	//! Splits `text` on `tokens` (leftmost-longest), calling `on_text` for the text between matches.
 	template <class ON_TEXT>
@@ -47,6 +50,8 @@ private:
 	unordered_map<uint64_t, Merge> merges;
 	//! The vocabulary id of each byte, after the GPT-2 byte-to-unicode mapping; -1 if it has none.
 	int64_t byte_ids[256];
+	//! Whether the text is NFC-normalized (`normalizer` in tokenizer.json, else none).
+	bool nfc = false;
 	//! Matched on the raw text (`normalized: false` in tokenizer.json).
 	std::vector<AddedToken> raw_added_tokens;
 	//! Matched on the NFC-normalized text (`normalized: true`).
@@ -55,5 +60,5 @@ private:
 	unordered_map<string, int64_t> added_ids;
 };
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

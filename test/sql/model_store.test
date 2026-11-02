@@ -2,28 +2,32 @@
 # description: a cached file whose content does not match the manifest is rejected and removed
 # group: [sql]
 
-require decision_tune
+require decide_onnx
 
 statement ok
-SET decision_tune_cache_dir = '{TEST_DIR}';
+SET decide_onnx_cache_dir = '{TEST_DIR}';
+
+# read the size before writing the file: decide_onnx_models() opens it, which Windows refuses while COPY writes it
+statement ok
+SET VARIABLE tokenizer_bytes = (SELECT file_bytes FROM decide_onnx_models() WHERE file_name = 'tokenizer.json');
 
 # same name and size as the real file, wrong content (csv adds the trailing newline)
 statement ok
-COPY (SELECT repeat('x', (SELECT file_bytes - 1 FROM decision_tune_models() WHERE file_name = 'tokenizer.json')::BIGINT))
+COPY (SELECT repeat('x', (getvariable('tokenizer_bytes') - 1)::BIGINT))
 TO '{TEST_DIR}/tokenizer.json' (FORMAT csv, HEADER false, QUOTE '');
 
 query I
-SELECT cached FROM decision_tune_models() WHERE file_name = 'tokenizer.json';
+SELECT cached FROM decide_onnx_models() WHERE file_name = 'tokenizer.json';
 ----
 true
 
 # (a column, so the optimizer does not fold the call into a constant first)
 statement error
-SELECT decision_tune_tokenize(s) FROM (SELECT 'hello' || i AS s FROM range(1) r(i));
+SELECT decide_onnx_tokenize(s) FROM (SELECT 'hello' || i AS s FROM range(1) r(i));
 ----
-IO Error: decision_tune: checksum mismatch for tokenizer.json
+IO Error: decide_onnx: checksum mismatch for tokenizer.json
 
 query I
-SELECT cached FROM decision_tune_models() WHERE file_name = 'tokenizer.json';
+SELECT cached FROM decide_onnx_models() WHERE file_name = 'tokenizer.json';
 ----
 false

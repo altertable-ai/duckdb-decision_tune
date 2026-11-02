@@ -1,55 +1,92 @@
 # name: test/sql/parity_decisions.test
-# description: decision_choose matches onnxruntime + tokenizers in Python (test/data/parity/decisions.csv)
+# description: decision_choose and decision_yes_no match the published vela3-fast code (test/data/parity/decisions.csv)
 # group: [sql]
 
-require decision_tune
+require decide_onnx
 
-require-env DECISION_TUNE_MODEL_PATH
+require json
+
+require-env DECIDE_ONNX_MODEL_PATH
 
 statement ok
-SET decision_tune_model_path = '{DECISION_TUNE_MODEL_PATH}';
+SET decide_onnx_model_path = '{DECIDE_ONNX_MODEL_PATH}';
 
 statement ok
 CREATE TABLE cases AS
-SELECT case_id::INTEGER AS case_id, coalesce(state, '') AS state, question, string_split(options, '␞') AS options,
+SELECT case_id::INTEGER AS case_id, kind, coalesce(state, '') AS state, state_is_json::BOOLEAN AS state_is_json,
+       question, string_split(keys, '␞') AS keys, string_split(descriptions, '␞') AS descriptions,
        probabilities::DOUBLE[] AS expected
 FROM read_csv('test/data/parity/decisions.csv', header = true, all_varchar = true, quote = '"', escape = '"');
 
 query I
 SELECT count(*) FROM cases;
 ----
-11
+14
 
+# On one thread, the cases share forward passes (short prompts are packed together)
+statement ok
+SET threads = 1;
+
+# A dict state is read as compact JSON; the options as `key: description`, or the key alone
 statement ok
 CREATE TABLE results AS
-SELECT case_id, expected, options, decision_choose(state, question, options) AS d FROM cases;
+SELECT case_id, expected, keys, decision_choose(state, question, map(keys, descriptions)) AS d
+FROM cases WHERE kind = 'choose' AND NOT state_is_json
+UNION ALL
+SELECT case_id, expected, keys, decision_choose(state::JSON, question, map(keys, descriptions)) AS d
+FROM cases WHERE kind = 'choose' AND state_is_json;
 
-# Same probabilities (a different ONNX Runtime build may round differently)
+query I
+SELECT count(*) FROM results;
+----
+9
+
+# With more threads than the cases fill, the queries below run each prompt alone
+statement ok
+SET threads = 16;
+
+# Same probabilities, up to the int8 storage of the weights (the largest difference is about 0.007)
 query I
 SELECT case_id FROM results
 WHERE len(expected) <> cardinality(d.probabilities)
-   OR list_max(list_transform(range(1, len(expected) + 1), lambda i: abs(expected[i] - d.probabilities[options[i]]))) > 1e-4
+   OR list_max(list_transform(range(1, len(expected) + 1), lambda i: abs(expected[i] - d.probabilities[keys[i]]))) > 2e-2
 ORDER BY case_id;
 ----
 
 # The choice is the most likely option, and the confidence its probability
 query I
-SELECT bool_and(d.choice = options[list_position(expected, list_max(expected))] AND abs(d.confidence - list_max(expected)) < 1e-4)
+SELECT bool_and(d.choice = keys[list_position(expected, list_max(expected))] AND abs(d.confidence - list_max(expected)) < 2e-2)
 FROM results;
 ----
 true
 
-# README example: Shipping at 71.2%, over Tech support at 20.9 and Billing at 7.9
-query IIII
-SELECT d.choice, round(d.probabilities['Shipping: delivery, lost or damaged packages'] * 100, 1),
-       round(d.probabilities['Tech support: bugs, crashes, login problems'] * 100, 1),
-       round(d.probabilities['Billing: charges, refunds, invoices'] * 100, 1)
-FROM results WHERE case_id = 0;
-----
-Shipping: delivery, lost or damaged packages	71.2	20.9	7.9
-
-# decision_yes_no is the probability of the first of the options ['yes', 'no']
+# A list of options reads like options without descriptions
 query I
-SELECT bool_and(abs(decision_yes_no(state, question) - expected[1]) < 1e-4) FROM cases WHERE options = ['yes', 'no'];
+SELECT case_id FROM cases
+WHERE kind = 'choose' AND list_max(descriptions) = ''
+  AND list_max(list_transform(range(1, len(expected) + 1),
+                              lambda i: abs(expected[i] - decision_choose(state, question, keys).probabilities[keys[i]]))) > 2e-2;
+----
+
+# decision_yes_no is P(yes), the second of the reference's options {no, yes}
+query I
+SELECT case_id FROM cases
+WHERE kind = 'yes_no'
+  AND abs(CASE WHEN state_is_json THEN decision_yes_no(state::JSON, question) ELSE decision_yes_no(state, question) END
+          - expected[2]) > 2e-2
+ORDER BY case_id;
+----
+
+# A STRUCT reads like the same JSON object
+query I
+SELECT abs(decision_yes_no({subject: 'Broken mug', message: 'The order arrived broken. I want my money back.'},
+                           'Is the customer asking for a refund or an exchange?') - expected[2]) < 2e-2
+FROM cases WHERE case_id = 3;
 ----
 true
+
+# README example: Shipping at 99.4%
+query II
+SELECT d.choice, round(d.probabilities['shipping'] * 100, 1) FROM results WHERE case_id = 0;
+----
+shipping	99.4

@@ -2,12 +2,12 @@
 # description: FROM ... DECIDE (...), the call forms, and the state rendering of structs, maps and JSON
 # group: [sql]
 
-require decision_tune
+require decide_onnx
 
-require-env DECISION_TUNE_MODEL_PATH
+require-env DECIDE_ONNX_MODEL_PATH
 
 statement ok
-SET decision_tune_model_path = '{DECISION_TUNE_MODEL_PATH}';
+SET decide_onnx_model_path = '{DECIDE_ONNX_MODEL_PATH}';
 
 statement ok
 CREATE TABLE tickets AS FROM (VALUES
@@ -47,7 +47,7 @@ WHERE team_confidence >= 0.5 AND refund_probabilities['yes'] < 0.99;
 ----
 2	true
 
-# The clause is the functions: one input is the state, several are read as "name: value | ..."
+# The clause is the functions: one input is the state, several are read as a compact JSON object
 query I
 SELECT bool_and(abs(a.team_confidence - b.d.confidence) < 1e-12 AND a.team = b.d.choice
                 AND abs(a.refund_probabilities['yes'] - b.p) < 1e-12 AND a.refund_confidence = greatest(b.p, 1 - b.p)
@@ -57,20 +57,22 @@ FROM (FROM tickets DECIDE (
         ASK 'Is the customer asking for a refund?' AS refund
         GIVEN subject, message)) a
 JOIN (SELECT id,
-             decision_choose('subject: ' || subject || ' | message: ' || message, 'Which team?',
+             decision_choose('{"subject":"' || subject || '","message":"' || message || '"}', 'Which team?',
                              MAP {'billing': 'Billing: charges, refunds, invoices', 'shipping': NULL, 'tech_support': ''}) AS d,
              decision_yes_no({subject: subject, message: message}, 'Is the customer asking for a refund?') AS p
       FROM tickets WHERE message IS NOT NULL) b USING (id);
 ----
 true
 
-# Keys without a description read as the key with spaces for underscores
-query I
-SELECT decision_choose(message, 'Which team?', ['billing', 'tech support']).probabilities['tech support']
-     = decision_choose(message, 'Which team?', {billing: NULL, tech_support: NULL}).probabilities['tech_support']
+# Keys without a description read as the key alone, keys with one as "key: description"
+query II
+SELECT decision_choose(message, 'Which team?', ['billing', 'tech_support']).probabilities['tech_support']
+     = decision_choose(message, 'Which team?', {billing: NULL, tech_support: ''}).probabilities['tech_support'],
+       decision_choose(message, 'Which team?', ['billing', 'tech: Tech support']).probabilities['tech: Tech support']
+     = decision_choose(message, 'Which team?', MAP {'billing': NULL, 'tech': 'Tech support'}).probabilities['tech']
 FROM tickets WHERE id = 3;
 ----
-true
+true	true
 
 # The call forms, spelled like the clause
 query I
@@ -82,14 +84,14 @@ FROM tickets WHERE id <= 3;
 ----
 true
 
-# A STRUCT and a MAP state read the same: "key: value | ..."; non-text values as compact JSON
-query I
-SELECT count(DISTINCT p) FROM (
-    SELECT decision_yes_no({subject: 'Hi', n: 3, tags: ['a', 'b'], ok: true}, 'Is this a greeting?') AS p
-    UNION ALL SELECT decision_yes_no(MAP {'subject': 'Hi', 'n': '3', 'tags': '["a","b"]', 'ok': 'true'}, 'Is this a greeting?')
-    UNION ALL SELECT decision_yes_no('subject: Hi | n: 3 | tags: ["a","b"] | ok: true', 'Is this a greeting?'));
+# A STRUCT and a MAP state read as compact JSON
+query II
+SELECT decision_yes_no({subject: 'Hi', n: 3, tags: ['a', 'b'], ok: true, note: NULL}, 'Is this a greeting?')
+     = decision_yes_no('{"subject":"Hi","n":3,"tags":["a","b"],"ok":true,"note":null}', 'Is this a greeting?'),
+       decision_yes_no(MAP {'subject': 'Hi', 'body': 'Hello there'}, 'Is this a greeting?')
+     = decision_yes_no('{"subject":"Hi","body":"Hello there"}', 'Is this a greeting?');
 ----
-1
+true	true
 
 # Any case, aliases on the source and on the result, joins after the clause
 query II
@@ -124,11 +126,11 @@ SELECT count(*), count(team), count(DISTINCT (id, team, team_confidence)) FROM r
 
 # An over-long prompt is refused, never truncated; TRY turns the error into NULL
 statement error
-SELECT decision_yes_no(repeat('word ', 9000), 'Is this long?');
+SELECT decision_yes_no(repeat('word ', 33000), 'Is this long?');
 ----
-more than the 8192-token context of DecisionTune 1.0
+more than the 32768-token context of vela3-fast
 
 query I
-SELECT TRY(decision_yes_no(repeat('word ', 9000), 'Is this long?'));
+SELECT TRY(decision_yes_no(repeat('word ', 33000), 'Is this long?'));
 ----
 NULL

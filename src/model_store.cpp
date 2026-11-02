@@ -1,6 +1,6 @@
-#include "decision_tune/model_store.hpp"
+#include "decide_onnx/model_store.hpp"
 
-#include "decision_tune/model_manifest.hpp"
+#include "decide_onnx/model_manifest.hpp"
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -13,12 +13,12 @@
 #include <random>
 
 namespace duckdb {
-namespace decision_tune {
+namespace decide_onnx {
 
-static constexpr const char *DEFAULT_MODEL_URL =
-    "https://huggingface.co/decision-tune/decisiontune-1.0/resolve/27056cb08bcf2b3ba1fd9bccb782b4dfd0498e1f";
-static constexpr const char *DEFAULT_CACHE_DIR = "~/.duckdb/decision_tune/1.0";
-//! Next to a verified file: "<sha256> <bytes> <mtime>", so later processes skip hashing 1.6 GB again.
+//! Where scripts/export uploads the files of ASSET_VERSION.
+static constexpr const char *DEFAULT_MODEL_URL = "https://assets.altertable.ai/decide_onnx/v5";
+static constexpr const char *DEFAULT_CACHE_DIR = "~/.duckdb/decide_onnx/v5";
+//! Next to a verified file: "<sha256> <bytes> <mtime>", so later processes skip hashing the model again.
 static constexpr const char *VERIFIED_SUFFIX = ".verified";
 static constexpr idx_t IO_CHUNK = 8 * 1024 * 1024;
 
@@ -38,7 +38,7 @@ ModelStore &ModelStore::Instance() {
 }
 
 static string CacheDir(ClientContext &context) {
-	auto dir = GetStringSetting(context, "decision_tune_cache_dir");
+	auto dir = GetStringSetting(context, "decide_onnx_cache_dir");
 	if (dir.empty()) {
 		dir = DEFAULT_CACHE_DIR;
 	}
@@ -50,14 +50,14 @@ string ModelStore::CachePath(ClientContext &context, const ModelFile &file) {
 }
 
 string ModelStore::FileUrl(ClientContext &context, const ModelFile &file) {
-	auto base = GetStringSetting(context, "decision_tune_model_url");
+	auto base = GetStringSetting(context, "decide_onnx_model_url");
 	if (base.empty()) {
 		base = DEFAULT_MODEL_URL;
 	}
 	while (!base.empty() && base.back() == '/') {
 		base.pop_back();
 	}
-	return base + "/" + file.remote_path;
+	return base + "/" + file.file_name;
 }
 
 bool ModelStore::IsCached(ClientContext &context, const ModelFile &file) {
@@ -137,7 +137,7 @@ static void VerifyCachedFile(FileSystem &fs, const string &path, const ModelFile
 	if (actual != file.sha256) {
 		fs.TryRemoveFile(path);
 		fs.TryRemoveFile(path + VERIFIED_SUFFIX);
-		throw IOException("decision_tune: checksum mismatch for %s (expected %s, got %s); the corrupted file '%s' was "
+		throw IOException("decide_onnx: checksum mismatch for %s (expected %s, got %s); the corrupted file '%s' was "
 		                  "removed, run the query again to download it",
 		                  file.file_name, file.sha256, actual, path);
 	}
@@ -179,14 +179,14 @@ static void Download(ClientContext &context, const ModelFile &file, const string
 	} catch (std::exception &ex) {
 		fs.TryRemoveFile(tmp);
 		ErrorData error(ex);
-		throw IOException("decision_tune: could not download %s: %s. To use local files instead, SET "
-		                  "decision_tune_model_path = '/path/to/decisiontune-1.0'",
+		throw IOException("decide_onnx: could not download %s: %s. To use local files instead, SET "
+		                  "decide_onnx_model_path = '/path/to/vela3-fast-onnx'",
 		                  url, error.RawMessage());
 	}
 	auto actual = Sha256Hex(sha);
 	if (actual != file.sha256) {
 		fs.TryRemoveFile(tmp);
-		throw IOException("decision_tune: checksum mismatch for %s (expected %s, got %s) after downloading %s",
+		throw IOException("decide_onnx: checksum mismatch for %s (expected %s, got %s) after downloading %s",
 		                  file.file_name, file.sha256, actual, url);
 	}
 	fs.TryRemoveFile(target + VERIFIED_SUFFIX);
@@ -200,15 +200,15 @@ static void Download(ClientContext &context, const ModelFile &file, const string
 ModelStore::Location ModelStore::Resolve(ClientContext &context) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	Location location;
-	auto explicit_path = GetStringSetting(context, "decision_tune_model_path");
+	auto explicit_path = GetStringSetting(context, "decide_onnx_model_path");
 	location.explicit_path = !explicit_path.empty();
 	location.directory = location.explicit_path ? fs.ExpandPath(explicit_path) : CacheDir(context);
 	if (!fs.IsPathAbsolute(location.directory)) {
 		location.directory = fs.JoinPath(FileSystem::GetWorkingDirectory(), location.directory);
 	}
 	if (location.explicit_path && !fs.DirectoryExists(location.directory)) {
-		throw IOException("decision_tune: decision_tune_model_path '%s' is not a directory (it should hold "
-		                  "tokenizer.json and model.onnx, or a copy of the Hugging Face repository)",
+		throw IOException("decide_onnx: decide_onnx_model_path '%s' is not a directory (it should hold "
+		                  "tokenizer.json and model.onnx)",
 		                  location.directory);
 	}
 	return location;
@@ -226,14 +226,12 @@ shared_ptr<ModelStore::ModelRecord> ModelStore::Record(const string &directory) 
 string ModelStore::EnsureFile(ClientContext &context, const Location &location, const ModelFile &file, bool &ready) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	if (location.explicit_path) {
-		// The flat layout, or a copy of the Hugging Face repository (onnx/model.onnx). Not checksummed.
-		for (auto candidate : {file.file_name, file.remote_path}) {
-			auto path = fs.JoinPath(location.directory, candidate);
-			if (fs.FileExists(path)) {
-				return path;
-			}
+		// Not checksummed.
+		auto path = fs.JoinPath(location.directory, file.file_name);
+		if (fs.FileExists(path)) {
+			return path;
 		}
-		throw IOException("decision_tune: decision_tune_model_path '%s' has no %s", location.directory, file.file_name);
+		throw IOException("decide_onnx: decide_onnx_model_path '%s' has no %s", location.directory, file.file_name);
 	}
 	auto path = fs.JoinPath(location.directory, file.file_name);
 	if (!ready) {
@@ -277,7 +275,7 @@ shared_ptr<DecisionModel> ModelStore::GetModel(ClientContext &context) {
 }
 
 //===--------------------------------------------------------------------===//
-// decision_tune_models()
+// decide_onnx_models()
 //===--------------------------------------------------------------------===//
 struct ModelsGlobalState : public GlobalTableFunctionState {
 	idx_t offset = 0;
@@ -312,19 +310,19 @@ static void ModelsFunction(ClientContext &context, TableFunctionInput &data, Dat
 
 void RegisterModelStore(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	config.AddExtensionOption("decision_tune_model_url",
-	                          "Base URL the DecisionTune files are downloaded from (a Hugging Face resolve URL)",
+	config.AddExtensionOption("decide_onnx_model_url",
+	                          "Base URL the vela3-fast tokenizer.json and model.onnx are downloaded from",
 	                          LogicalType::VARCHAR, Value(DEFAULT_MODEL_URL));
-	config.AddExtensionOption("decision_tune_cache_dir", "Directory downloaded DecisionTune files are cached in",
+	config.AddExtensionOption("decide_onnx_cache_dir", "Directory downloaded vela3-fast files are cached in",
 	                          LogicalType::VARCHAR, Value(DEFAULT_CACHE_DIR));
-	config.AddExtensionOption("decision_tune_model_path",
+	config.AddExtensionOption("decide_onnx_model_path",
 	                          "Local directory with tokenizer.json and model.onnx to use instead of the download cache "
 	                          "(no checksum check)",
 	                          LogicalType::VARCHAR, Value(""));
 
-	TableFunction models("decision_tune_models", {}, ModelsFunction, ModelsBind, ModelsInit);
+	TableFunction models("decide_onnx_models", {}, ModelsFunction, ModelsBind, ModelsInit);
 	loader.RegisterFunction(models);
 }
 
-} // namespace decision_tune
+} // namespace decide_onnx
 } // namespace duckdb

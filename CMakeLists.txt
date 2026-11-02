@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-set(TARGET_NAME decision_tune)
+set(TARGET_NAME decide_onnx)
 
 # ONNX Runtime (CPU execution provider) from vcpkg, linked statically. See
 # vcpkg_ports/README.md. DuckDB's tidy configure is not a vcpkg build, so the
@@ -14,7 +14,7 @@ endif()
 # them flat.
 if(onnxruntime_FOUND)
   find_path(
-    DECISION_TUNE_ORT_INCLUDE_DIR
+    DECIDE_ONNX_ORT_INCLUDE_DIR
     NAMES onnxruntime_cxx_api.h
     PATH_SUFFIXES onnxruntime REQUIRED)
 endif()
@@ -27,7 +27,7 @@ project(${TARGET_NAME})
 include_directories(src/include)
 
 set(EXTENSION_SOURCES
-    src/decision_tune_extension.cpp
+    src/decide_onnx_extension.cpp
     src/decide_functions.cpp
     src/decide_grammar.cpp
     src/decision_model.cpp
@@ -50,7 +50,7 @@ endforeach()
 if(onnxruntime_FOUND)
   foreach(_target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
     target_include_directories(${_target}
-                               PRIVATE ${DECISION_TUNE_ORT_INCLUDE_DIR})
+                               PRIVATE ${DECIDE_ONNX_ORT_INCLUDE_DIR})
     target_link_libraries(${_target} onnxruntime::onnxruntime)
   endforeach()
 endif()
