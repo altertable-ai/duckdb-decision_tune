@@ -3,61 +3,16 @@
 #include <algorithm>
 #include <cmath>
 
-// DECIDE_ONNX_USE_MLAS selects MLAS on Apple platforms too, to test that path there.
-#if defined(__APPLE__) && !defined(DECIDE_ONNX_USE_MLAS)
-#define DECIDE_ONNX_ACCELERATE
-#endif
-
-#ifdef DECIDE_ONNX_ACCELERATE
-#ifndef ACCELERATE_NEW_LAPACK
-#define ACCELERATE_NEW_LAPACK
-#endif
-#include <Accelerate/Accelerate.h>
-#else
-// MLAS, ONNX Runtime's linear algebra library, is linked statically with ONNX Runtime; its header is not installed, so
-// third_party/mlas carries the one of the ONNX Runtime version the vcpkg port builds.
-#include "mlas.h"
-#endif
-
 namespace duckdb {
 namespace decide_onnx {
 namespace gated_delta_net {
-
-#ifdef DECIDE_ONNX_ACCELERATE
-static void Gemm(bool trans_a, bool trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda,
-                 const float *b, size_t ldb, float beta, float *c, size_t ldc) {
-	cblas_sgemm(CblasRowMajor, trans_a ? CblasTrans : CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans,
-	            static_cast<__LAPACK_int>(m), static_cast<__LAPACK_int>(n), static_cast<__LAPACK_int>(k), alpha, a,
-	            static_cast<__LAPACK_int>(lda), b, static_cast<__LAPACK_int>(ldb), beta, c,
-	            static_cast<__LAPACK_int>(ldc));
-}
-
-static void Exp(const float *x, float *y, size_t n) {
-	const int count = static_cast<int>(n);
-	vvexpf(y, x, &count);
-}
-#else
-static void Gemm(bool trans_a, bool trans_b, size_t m, size_t n, size_t k, float alpha, const float *a, size_t lda,
-                 const float *b, size_t ldb, float beta, float *c, size_t ldc) {
-	MlasGemm(trans_a ? CblasTrans : CblasNoTrans, trans_b ? CblasTrans : CblasNoTrans, m, n, k, alpha, a, lda, b, ldb,
-	         beta, c, ldc, nullptr, nullptr);
-}
-
-static void Exp(const float *x, float *y, size_t n) {
-	MlasComputeExp(x, y, n);
-}
-#endif
-
-const Backend &DefaultBackend() {
-	static const Backend backend {Gemm, Exp};
-	return backend;
-}
 
 void Workspace::Reserve(const Shape &shape) {
 	const size_t tokens = shape.tokens, channels = shape.Channels(), heads = shape.heads, chunk = shape.chunk;
 	const size_t key_dim = shape.key_dim, value_dim = shape.value_dim;
 	const size_t padded = (tokens + chunk - 1) / chunk * chunk;
-	conv.resize(padded * channels), decay.resize(padded * heads), beta.resize(padded * heads), row.resize(channels);
+	conv.resize(padded * channels), decay.resize(padded * heads), beta.resize(padded * heads);
+	row.resize(std::max<size_t>(channels, heads * value_dim));
 	output.resize(chunk * value_dim);
 	state.resize(key_dim * value_dim);
 	kb.resize(chunk * key_dim), kbd.resize(chunk * key_dim), qd.resize(chunk * key_dim), kd.resize(chunk * key_dim);
@@ -89,9 +44,9 @@ static float Softplus(float x) {
 
 //! The causal conv and SiLU of every channel, the L2 norms of the q and k heads, and the gates. The rows past the
 //! prompt, up to a whole number of chunks, are zeros: they add nothing to the state and read nothing.
-static void Prepare(const Shape &s, const float *mixed, const float *a, const float *b, const float *taps,
-                    const float *neg_a, const float *dt_bias, Workspace &ws, const Backend &be) {
-	const int64_t tokens = s.tokens, channels = s.Channels(), num_taps = s.taps;
+static void Prepare(const Shape &s, const float *projection, const float *taps, const float *neg_a,
+                    const float *dt_bias, Workspace &ws, const Backend &be) {
+	const int64_t tokens = s.tokens, channels = s.Channels(), num_taps = s.taps, width = s.Width();
 	const std::vector<float> zeros(channels, 0.0f);
 	std::vector<const float *> rows(num_taps);
 	const float q_scale = 1.0f / std::sqrt(static_cast<float>(s.key_dim));
@@ -102,7 +57,7 @@ static void Prepare(const Shape &s, const float *mixed, const float *a, const fl
 		float *__restrict y = ws.conv.data() + t * channels;
 		for (int64_t j = 0; j < num_taps; j++) {
 			const int64_t source = t - (num_taps - 1) + j;
-			rows[j] = source < 0 ? zeros.data() : mixed + source * channels;
+			rows[j] = source < 0 ? zeros.data() : projection + source * width;
 		}
 		if (num_taps == 4) {
 			const float *__restrict x0 = rows[0], *__restrict x1 = rows[1], *__restrict x2 = rows[2],
@@ -139,10 +94,11 @@ static void Prepare(const Shape &s, const float *mixed, const float *a, const fl
 				}
 			}
 		}
+		const float *b = projection + t * width + channels + s.heads * s.value_dim, *a = b + s.heads;
 		for (int64_t h = 0; h < s.heads; h++) {
 			const int64_t i = t * s.heads + h;
-			ws.decay[i] = neg_a[h] * Softplus(a[i] + dt_bias[h]);
-			ws.beta[i] = 1.0f / (1.0f + std::exp(-b[i]));
+			ws.decay[i] = neg_a[h] * Softplus(a[h] + dt_bias[h]);
+			ws.beta[i] = 1.0f / (1.0f + std::exp(-b[h]));
 		}
 	}
 	std::fill(ws.conv.begin() + tokens * channels, ws.conv.end(), 0.0f);
@@ -211,19 +167,32 @@ static void DeltaRuleHead(const Shape &s, int64_t h, float *out, Workspace &ws, 
 			std::fill(ai + i, ai + len, 0.0f);
 			std::fill(qi + i + 1, qi + len, 0.0f);
 		}
-		// x = (I + A)^-1, row by row: x_i = e_i - sum over m < i of A_im x_m (row m of x is zero past column m).
+		// x = (I + A)^-1 by forward substitution, two rows at a time: x_i = e_i - sum over m < i of A_im x_m. Each
+		// row m is read once for both rows, which accumulate in local arrays. Row m is zero past column
+		// m, so the updates may span whole groups of 8 columns, without a remainder loop.
 		float *x = ws.x.data();
-		for (int64_t i = 0; i < len; i++) {
-			float *xi = x + i * len;
-			std::fill(xi, xi + len, 0.0f);
-			xi[i] = 1.0f;
+		static_assert(Shape::chunk % 8 == 0, "the forward substitution works on pairs of rows and groups of 8 columns");
+		for (int64_t i = 0; i < len; i += 2) {
+			float r0[Shape::chunk] = {}, r1[Shape::chunk] = {};
 			for (int64_t m = 0; m < i; m++) {
-				const float aim = a[i * len + m];
+				const float a0 = a[i * len + m], a1 = a[(i + 1) * len + m];
 				const float *xm = x + m * len;
-				for (int64_t j = 0; j <= m; j++) {
-					xi[j] -= aim * xm[j];
+				for (int64_t j = 0; j < ((m + 8) & ~int64_t(7)); j++) {
+					r0[j] -= a0 * xm[j];
+					r1[j] -= a1 * xm[j];
 				}
 			}
+			r0[i] = 1.0f;
+			std::fill(r0 + i + 1, r0 + len, 0.0f);
+			std::copy(r0, r0 + len, x + i * len);
+			// Row i + 1 also takes row i, the last of its terms.
+			const float a10 = a[(i + 1) * len + i];
+			for (int64_t j = 0; j <= i; j++) {
+				r1[j] -= a10 * r0[j];
+			}
+			r1[i + 1] = 1.0f;
+			std::fill(r1 + i + 2, r1 + len, 0.0f);
+			std::copy(r1, r1 + len, x + (i + 1) * len);
 		}
 		float *u = ws.u.data(), *w = ws.w.data();
 		be.gemm(false, false, len, dv, len, 1.0f, x, len, ws.vb.data(), dv, 0.0f, u, dv);  // new values
@@ -242,13 +211,36 @@ static void DeltaRuleHead(const Shape &s, int64_t h, float *out, Workspace &ws, 
 	}
 }
 
-void Mixer(const Shape &shape, const float *mixed_qkv, const float *a, const float *b, const float *taps,
-           const float *neg_a, const float *dt_bias, float *out, Workspace &workspace, const Backend &backend) {
+//! out = RMSNorm(out) of each head, times the norm's weight, times SiLU(z), token by token.
+static void GatedNorm(const Shape &s, const float *projection, const float *weight, float eps, float *out,
+                      Workspace &ws, const Backend &be) {
+	const int64_t dv = s.value_dim, value_width = s.heads * dv;
+	float *gate = ws.row.data();
+	for (int64_t t = 0; t < s.tokens; t++) {
+		const float *z = projection + t * s.Width() + s.Channels();
+		for (int64_t c = 0; c < value_width; c++) {
+			gate[c] = -z[c];
+		}
+		be.exp(gate, gate, value_width);
+		for (int64_t h = 0; h < s.heads; h++) {
+			float *o = out + t * value_width + h * dv;
+			const float *zh = z + h * dv, *eh = gate + h * dv;
+			const float scale = 1.0f / std::sqrt(SumSquares(o, dv) / static_cast<float>(dv) + eps);
+			for (int64_t d = 0; d < dv; d++) {
+				o[d] = weight[d] * (o[d] * scale) * (zh[d] / (1.0f + eh[d]));
+			}
+		}
+	}
+}
+
+void Mixer(const Shape &shape, const float *projection, const float *taps, const float *neg_a, const float *dt_bias,
+           const float *norm_weight, float eps, float *out, Workspace &workspace, const Backend &backend) {
 	workspace.Reserve(shape);
-	Prepare(shape, mixed_qkv, a, b, taps, neg_a, dt_bias, workspace, backend);
+	Prepare(shape, projection, taps, neg_a, dt_bias, workspace, backend);
 	for (int64_t h = 0; h < shape.heads; h++) {
 		DeltaRuleHead(shape, h, out, workspace, backend);
 	}
+	GatedNorm(shape, projection, norm_weight, eps, out, workspace, backend);
 }
 
 } // namespace gated_delta_net

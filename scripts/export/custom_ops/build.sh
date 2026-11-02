@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
-# Builds out/libdecide_onnx_ops.{dylib,so}: the extension's custom ops (src/custom_ops.cpp, src/gated_delta_net.cpp)
-# for Python's onnxruntime, so that export_onejev.py --fused-mixer can check the graphs that use them.
+# Builds out/libdecide_onnx_ops.{dylib,so}: the extension's custom ops (src/custom_ops.cpp and the kernels it runs) for
+# Python's onnxruntime, so that export_onejev.py --custom-ops can check the graphs that use them.
 #
 #   sh custom_ops/build.sh            (from scripts/export)
 #
@@ -14,7 +14,8 @@ if [ -z "${VCPKG_INSTALLED:-}" ]; then
 	VCPKG_INSTALLED=$(ls -d "$root"/build/release/vcpkg_installed/*/ | grep -v vcpkg/ | head -n 1)
 fi
 mkdir -p "$here/../out"
-sources="$here/library.cpp $root/src/custom_ops.cpp $root/src/gated_delta_net.cpp"
+sources="$here/library.cpp $root/src/custom_ops.cpp $root/src/cpu_backend.cpp $root/src/elementwise.cpp
+	$root/src/causal_attention.cpp $root/src/gated_delta_net.cpp"
 flags="-std=c++17 -O3 -shared -fPIC -DORT_API_MANUAL_INIT -I$root/src/include -I$VCPKG_INSTALLED/include/onnxruntime"
 lib="$VCPKG_INSTALLED/lib"
 out="$here/../out/libdecide_onnx_ops"

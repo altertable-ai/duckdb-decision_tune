@@ -37,8 +37,15 @@ set(EXTENSION_SOURCES
 # These files include onnxruntime (or MLAS) headers. Skip them when the tidy job
 # has no ONNX Runtime.
 if(onnxruntime_FOUND)
-  list(APPEND EXTENSION_SOURCES src/ort_scorer.cpp src/custom_ops.cpp
-       src/gated_delta_net.cpp)
+  list(
+    APPEND
+    EXTENSION_SOURCES
+    src/ort_scorer.cpp
+    src/custom_ops.cpp
+    src/cpu_backend.cpp
+    src/elementwise.cpp
+    src/causal_attention.cpp
+    src/gated_delta_net.cpp)
 endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -53,9 +60,9 @@ if(onnxruntime_FOUND)
     target_include_directories(${_target}
                                PRIVATE ${DECIDE_ONNX_ORT_INCLUDE_DIR})
     target_link_libraries(${_target} onnxruntime::onnxruntime)
-    # The Gated DeltaNet kernel (src/gated_delta_net.cpp) runs on Accelerate on
-    # Apple platforms and on ONNX Runtime's MLAS elsewhere, whose header ONNX
-    # Runtime does not install (see third_party/mlas).
+    # The custom kernels (src/cpu_backend.cpp) run on Accelerate on Apple
+    # platforms and on ONNX Runtime's MLAS elsewhere, whose header ONNX Runtime
+    # does not install (see third_party/mlas).
     if(APPLE)
       target_link_libraries(${_target} "-framework Accelerate")
     else()

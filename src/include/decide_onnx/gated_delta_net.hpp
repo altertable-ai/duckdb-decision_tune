@@ -1,30 +1,13 @@
 #pragma once
 
-#include <cstddef>
+#include "decide_onnx/cpu_backend.hpp"
+
 #include <cstdint>
 #include <vector>
-
-// This header and gated_delta_net.cpp depend on neither DuckDB nor ONNX Runtime's headers, so that
-// scripts/export/custom_ops builds them into the library the export checks its graphs with.
 
 namespace duckdb {
 namespace decide_onnx {
 namespace gated_delta_net {
-
-//! C = alpha * op(A) * op(B) + beta * C, row-major.
-using Sgemm = void (*)(bool trans_a, bool trans_b, size_t m, size_t n, size_t k, float alpha, const float *a,
-                       size_t lda, const float *b, size_t ldb, float beta, float *c, size_t ldc);
-//! y[i] = exp(x[i]) for n values; x and y may be the same array.
-using VecExp = void (*)(const float *x, float *y, size_t n);
-
-//! The SGEMM and vector exp the kernel runs on: Accelerate on Apple platforms, ONNX Runtime's MLAS elsewhere.
-struct Backend {
-	Sgemm gemm;
-	VecExp exp;
-};
-
-//! The default backend of this build.
-const Backend &DefaultBackend();
 
 //! The sizes of one Gated DeltaNet layer over one prompt.
 struct Shape {
@@ -33,10 +16,15 @@ struct Shape {
 	int64_t key_dim;
 	int64_t value_dim;
 	int64_t taps;
-	int64_t chunk = 64;
-	//! The width of the input projection the mixer reads: q, k and v of every head.
+	//! The delta rule's chunk; a compile-time constant (and even), which the forward substitution relies on.
+	static constexpr int64_t chunk = 64;
+	//! The width of the conv's channels: q, k and v of every head.
 	int64_t Channels() const {
 		return heads * (2 * key_dim + value_dim);
+	}
+	//! The width of the layer's input projection, per token: the conv's channels, then z, b and a.
+	int64_t Width() const {
+		return Channels() + heads * value_dim + 2 * heads;
 	}
 };
 
@@ -47,17 +35,19 @@ struct Workspace {
 	void Reserve(const Shape &shape);
 };
 
-//! The token mixer of a Gated DeltaNet layer (Qwen3.5 linear attention) for one prompt, from a zero state:
-//!   mixed_qkv [T, C] -> causal depthwise conv of `taps` [K, C], then SiLU -> q, k, v
+//! The token mixer and gated norm of a Gated DeltaNet layer (Qwen3.5 linear attention) for one prompt, from a zero
+//! state. `projection` [T, Width()] holds, per token, mixed_qkv [C], z [H * value_dim], b [H] and a [H]:
+//!   mixed_qkv -> causal depthwise conv of `taps` [K, C], then SiLU -> q, k, v
 //!   q and k L2-normalized per head, q also scaled by key_dim^-0.5
-//!   decay = neg_a * softplus(a + dt_bias), beta = sigmoid(b)                      a, b: [T, H]
-//!   out [T, H * value_dim] = the gated delta rule over q, k, v, decay and beta
-//! It computes what transformers' Qwen3_5GatedDeltaNet computes between in_proj and its gated norm. The delta rule
+//!   decay = neg_a * softplus(a + dt_bias), beta = sigmoid(b)
+//!   o = the gated delta rule over q, k, v, decay and beta
+//!   out [T, H * value_dim] = RMSNorm(o) of each head, times norm_weight [value_dim], times SiLU(z)
+//! It computes what transformers' Qwen3_5GatedDeltaNet computes between in_proj and out_proj. The delta rule
 //! runs in chunks of `chunk` tokens, in the WY form of transformers' torch_chunk_gated_delta_rule: within a chunk the
 //! strictly lower triangular system (I + A) is inverted by forward substitution, and the rest is 8 GEMMs per chunk
 //! and head, reading q, k and v in place. A token's output depends only on the tokens up to it, bit for bit.
-void Mixer(const Shape &shape, const float *mixed_qkv, const float *a, const float *b, const float *taps,
-           const float *neg_a, const float *dt_bias, float *out, Workspace &workspace, const Backend &backend);
+void Mixer(const Shape &shape, const float *projection, const float *taps, const float *neg_a, const float *dt_bias,
+           const float *norm_weight, float eps, float *out, Workspace &workspace, const Backend &backend);
 
 } // namespace gated_delta_net
 } // namespace decide_onnx

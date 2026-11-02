@@ -95,14 +95,25 @@ It writes `out/onejev/`: `model_fp32.onnx` and `model.onnx` (int8 projections), 
 uv run python -I export_onejev.py
 ```
 
-With `--fused-mixer`, it also writes `model_fused_fp32.onnx` and `model_fused.onnx`, whose 18 Gated DeltaNet layers
-are one `decide_onnx.GatedDeltaNetMixer` node each: the extension's own CPU kernel (`src/gated_delta_net.cpp`,
-registered by `src/custom_ops.cpp`). ONNX Runtime's CPU `LinearAttention` runs the delta rule token by token; the
-kernel runs it in chunks of 64 tokens on GEMMs (Accelerate on Apple platforms, ONNX Runtime's MLAS elsewhere), with
-the causal conv, the L2 norms and the gates in one pass. Python's onnxruntime loads it from a library that
-`custom_ops/build.sh` builds from the same sources, after `make release`:
+With `--custom-ops`, it also writes `model_fused_fp32.onnx` and `model_fused.onnx`, which run on the extension's own
+CPU kernels, registered by `src/custom_ops.cpp`:
+
+- `decide_onnx.GatedDeltaNetMixer` (`src/gated_delta_net.cpp`) is each Gated DeltaNet layer between its input and
+  output projections. ONNX Runtime's CPU `LinearAttention` runs the delta rule token by token; the kernel runs it in
+  chunks of 64 tokens on GEMMs, with the causal conv, the L2 norms and the gates in one pass before it and the gated
+  norm after it.
+- `decide_onnx.CausalAttention` (`src/causal_attention.cpp`) is the attention of each full-attention layer, in blocks
+  of 64 queries on GEMMs. `GroupQueryAttention`'s CPU flash-attention path takes about 4 times as long in ONNX Runtime
+  1.29, and its other path holds the T × T scores of every head.
+- `decide_onnx.SwiGlu` (`src/elementwise.cpp`) is each MLP's activation, read from the fused gate and up projection in
+  place, and `decide_onnx.AddRmsNorm` each residual connection with the RMSNorm after it, in one pass instead of an
+  `Add` and a `SimplifiedLayerNormalization`, which take about 2.5 times as long on ONNX Runtime's CPU kernels.
+
+The GEMMs and exps run on Accelerate on Apple platforms and on ONNX Runtime's MLAS elsewhere (`src/cpu_backend.cpp`).
+Python's onnxruntime loads the ops from a library that `custom_ops/build.sh` builds from the same sources, after
+`make release`:
 
 ```bash
 sh custom_ops/build.sh            # MLAS=1 builds the MLAS backend on Apple platforms too
-uv run python -I export_onejev.py --fused-mixer out/libdecide_onnx_ops.dylib
+uv run python -I export_onejev.py --custom-ops out/libdecide_onnx_ops.dylib
 ```
