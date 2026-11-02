@@ -7,40 +7,51 @@ namespace decide_onnx {
 namespace causal_attention {
 
 void Workspace::Reserve(const Shape &shape) {
-	const size_t padded = (shape.tokens + shape.block - 1) / shape.block * shape.block, dim = shape.head_dim;
-	queries.resize(padded * dim), keys.resize(padded * dim), values.resize(padded * dim);
-	scores.resize(shape.block * padded), output.resize(shape.block * dim);
+	const size_t padded = shape.Padded(), keys_rows = shape.past + padded, dim = shape.head_dim;
+	queries.resize(padded * dim), keys.resize(keys_rows * dim), values.resize(keys_rows * dim);
+	scores.resize(shape.block * keys_rows), output.resize(shape.block * dim);
 }
 
-//! Copies head `head` of [T, heads, dim] into [padded, dim]; the rows past T are zeros.
-static void GatherHead(const float *x, int64_t tokens, int64_t heads, int64_t head, int64_t dim,
+//! Copies head `head` of the first `count` rows of [rows, heads, dim] into [count, dim], then zeros up to `to`'s end.
+static void GatherHead(const float *x, int64_t count, int64_t heads, int64_t head, int64_t dim,
                        std::vector<float> &to) {
-	for (int64_t t = 0; t < tokens; t++) {
+	for (int64_t t = 0; t < count; t++) {
 		const float *row = x + (t * heads + head) * dim;
 		std::copy(row, row + dim, to.data() + t * dim);
 	}
-	std::fill(to.begin() + tokens * dim, to.end(), 0.0f);
+	std::fill(to.begin() + count * dim, to.end(), 0.0f);
 }
 
-void Attention(const Shape &s, const float *q, const float *k, const float *v, float scale, float *out, Workspace &ws,
+void Attention(const Shape &s, int64_t rows, const float *q, const float *k, const float *v, const float *past_k,
+               const float *past_v, float scale, float *out, float *present_k, float *present_v, Workspace &ws,
                const Backend &be) {
 	ws.Reserve(s);
-	const int64_t tokens = s.tokens, dim = s.head_dim, block = s.block, group = s.heads / s.kv_heads;
-	const int64_t padded = (tokens + block - 1) / block * block;
+	const int64_t tokens = s.tokens, past = s.past, dim = s.head_dim, block = s.block, group = s.heads / s.kv_heads;
+	const int64_t padded = s.Padded(), kv_width = s.kv_heads * dim;
+	// present = the past keys and values, the prompt's, then zeros.
+	auto concatenate = [&](const float *cached, const float *prompt, float *present) {
+		std::copy(cached, cached + past * kv_width, present);
+		std::copy(prompt, prompt + tokens * kv_width, present + past * kv_width);
+		std::fill(present + (past + tokens) * kv_width, present + (past + rows) * kv_width, 0.0f);
+	};
+	concatenate(past_k, k, present_k);
+	concatenate(past_v, v, present_v);
+	std::fill(out, out + rows * s.heads * dim, 0.0f);
 	for (int64_t kv = 0; kv < s.kv_heads; kv++) {
-		GatherHead(k, tokens, s.kv_heads, kv, dim, ws.keys);
-		GatherHead(v, tokens, s.kv_heads, kv, dim, ws.values);
+		GatherHead(present_k, past + tokens, s.kv_heads, kv, dim, ws.keys);
+		GatherHead(present_v, past + tokens, s.kv_heads, kv, dim, ws.values);
 		for (int64_t h = kv * group; h < (kv + 1) * group; h++) {
 			GatherHead(q, tokens, s.heads, h, dim, ws.queries);
 			for (int64_t start = 0; start < padded; start += block) {
-				// The block's queries against every key up to its last query; row i sees the keys up to start + i.
-				const int64_t end = start + block, valid = std::min(block, tokens - start);
+				// The block's queries against every key up to its last query; row i sees the keys up to past + start +
+				// i.
+				const int64_t end = past + start + block, valid = std::min(block, tokens - start);
 				float *scores = ws.scores.data();
 				be.gemm(false, true, block, end, dim, scale, ws.queries.data() + start * dim, dim, ws.keys.data(), dim,
 				        0.0f, scores, end);
 				for (int64_t i = 0; i < block; i++) {
 					float *row = scores + i * end;
-					const int64_t seen = start + i + 1;
+					const int64_t seen = past + start + i + 1;
 					const float max = *std::max_element(row, row + seen);
 					for (int64_t j = 0; j < seen; j++) {
 						row[j] -= max;

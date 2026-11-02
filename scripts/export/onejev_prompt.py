@@ -65,3 +65,16 @@ def render(tokenizer, state, question) -> tuple[str, list[str]]:
                                           {"role": "user", "content": user}],
                                          tokenize=False, add_generation_prompt=True, enable_thinking=False)
     return text, labels
+
+
+def render_parts(tokenizer, state, question) -> tuple[tuple[str, str, str], list[str]]:
+    """`render`'s prompt cut where a cache can end: the system turn up to the user turn's content (the same for every
+    prompt), the state block (the same for every question about one state), and the question with its options and the
+    assistant turn's opening. The three tokenize to the whole prompt's tokens: each cut follows a newline, which the
+    tokenizer does not merge with the text after it."""
+    text, labels = render(tokenizer, state, question)
+    user, _ = user_turn(state, question)
+    state_block = f"<state>\n{render_state(state)}\n</state>\n\n"
+    start = text.index(user)
+    cut = start + len(state_block)
+    return (text[:start], text[start:cut], text[cut:]), labels

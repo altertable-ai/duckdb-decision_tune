@@ -42,22 +42,25 @@ static float Softplus(float x) {
 	return x > 20.0f ? x : std::log1p(std::exp(x));
 }
 
+//! Row `source` of the conv's input: the prompt's projection from 0, the initial conv rows before it.
+static const float *ConvInput(const Shape &s, const float *projection, const float *initial_conv, int64_t source) {
+	return source < 0 ? initial_conv + (s.taps - 1 + source) * s.Channels() : projection + source * s.Width();
+}
+
 //! The causal conv and SiLU of every channel, the L2 norms of the q and k heads, and the gates. The rows past the
 //! prompt, up to a whole number of chunks, are zeros: they add nothing to the state and read nothing.
-static void Prepare(const Shape &s, const float *projection, const float *taps, const float *neg_a,
-                    const float *dt_bias, Workspace &ws, const Backend &be) {
+static void Prepare(const Shape &s, const float *projection, const float *initial_conv, const float *taps,
+                    const float *neg_a, const float *dt_bias, Workspace &ws, const Backend &be) {
 	const int64_t tokens = s.tokens, channels = s.Channels(), num_taps = s.taps, width = s.Width();
-	const std::vector<float> zeros(channels, 0.0f);
 	std::vector<const float *> rows(num_taps);
 	const float q_scale = 1.0f / std::sqrt(static_cast<float>(s.key_dim));
 	float *scratch = ws.row.data();
 	for (int64_t t = 0; t < tokens; t++) {
-		// The conv reads the current token and the taps - 1 before it; the rows before the prompt are zeros. One pass
-		// over all taps, through restrict pointers so that the compiler keeps the sum in registers.
+		// The conv reads the current token and the taps - 1 before it, from the initial conv rows before the prompt.
+		// One pass over all taps, through restrict pointers so that the compiler keeps the sum in registers.
 		float *__restrict y = ws.conv.data() + t * channels;
 		for (int64_t j = 0; j < num_taps; j++) {
-			const int64_t source = t - (num_taps - 1) + j;
-			rows[j] = source < 0 ? zeros.data() : projection + source * width;
+			rows[j] = ConvInput(s, projection, initial_conv, t - (num_taps - 1) + j);
 		}
 		if (num_taps == 4) {
 			const float *__restrict x0 = rows[0], *__restrict x1 = rows[1], *__restrict x2 = rows[2],
@@ -106,17 +109,19 @@ static void Prepare(const Shape &s, const float *projection, const float *taps, 
 	std::fill(ws.beta.begin() + tokens * s.heads, ws.beta.end(), 0.0f);
 }
 
-//! The gated delta rule of head h over the prepared q, k and v, from a zero state, written to its columns of `out`.
-//! Every chunk is a whole one (the last is padded with the zero rows of Prepare), so that every GEMM has the same
-//! shape: a token's output then never depends on the tokens after it, and a prompt in a right-padded batch gets
-//! exactly the values it gets alone.
-static void DeltaRuleHead(const Shape &s, int64_t h, float *out, Workspace &ws, const Backend &be) {
+//! The gated delta rule of head h over the prepared q, k and v, from its initial state, written to its columns of
+//! `out`; its state after the prompt goes to `final_state`. Every chunk is a whole one (the last is padded with the
+//! zero rows of Prepare, which leave the state as it is), so that every GEMM has the same shape: a token's output then
+//! never depends on the tokens after it, and a prompt in a right-padded batch gets exactly the values it gets alone.
+static void DeltaRuleHead(const Shape &s, int64_t h, const float *initial_state, float *out, float *final_state,
+                          Workspace &ws, const Backend &be) {
 	const int64_t tokens = s.tokens, heads = s.heads, dk = s.key_dim, dv = s.value_dim;
 	const int64_t ld = s.Channels(), ld_out = heads * dv;
 	const float *q_all = ws.conv.data() + h * dk, *k_all = ws.conv.data() + (heads + h) * dk;
 	const float *v_all = ws.conv.data() + 2 * heads * dk + h * dv;
+	const int64_t state_size = dk * dv;
 	float *state = ws.state.data();
-	std::fill(ws.state.begin(), ws.state.end(), 0.0f);
+	std::copy(initial_state + h * state_size, initial_state + (h + 1) * state_size, state);
 	for (int64_t start = 0; start < tokens; start += s.chunk) {
 		const int64_t len = s.chunk, valid = std::min<int64_t>(s.chunk, tokens - start);
 		const float *q = q_all + start * ld, *k = k_all + start * ld, *v = v_all + start * ld;
@@ -209,6 +214,7 @@ static void DeltaRuleHead(const Shape &s, int64_t h, float *out, Workspace &ws, 
 		}
 		be.gemm(true, false, dk, dv, len, 1.0f, ws.kd.data(), dk, u, dv, 1.0f, state, dv); // S += k_d^T v_new
 	}
+	std::copy(state, state + state_size, final_state + h * state_size);
 }
 
 //! out = RMSNorm(out) of each head, times the norm's weight, times SiLU(z), token by token.
@@ -234,13 +240,20 @@ static void GatedNorm(const Shape &s, const float *projection, const float *weig
 }
 
 void Mixer(const Shape &shape, const float *projection, const float *taps, const float *neg_a, const float *dt_bias,
-           const float *norm_weight, float eps, float *out, Workspace &workspace, const Backend &backend) {
+           const float *norm_weight, float eps, const float *initial_state, const float *initial_conv, float *out,
+           float *final_state, float *final_conv, Workspace &workspace, const Backend &backend) {
 	workspace.Reserve(shape);
-	Prepare(shape, projection, taps, neg_a, dt_bias, workspace, backend);
+	Prepare(shape, projection, initial_conv, taps, neg_a, dt_bias, workspace, backend);
 	for (int64_t h = 0; h < shape.heads; h++) {
-		DeltaRuleHead(shape, h, out, workspace, backend);
+		DeltaRuleHead(shape, h, initial_state, out, final_state, workspace, backend);
 	}
 	GatedNorm(shape, projection, norm_weight, eps, out, workspace, backend);
+	// The conv's input rows that the next tokens read: the last taps - 1 before the end of the prompt.
+	const int64_t channels = shape.Channels();
+	for (int64_t j = 0; j < shape.taps - 1; j++) {
+		const float *row = ConvInput(shape, projection, initial_conv, shape.tokens - (shape.taps - 1) + j);
+		std::copy(row, row + channels, final_conv + j * channels);
+	}
 }
 
 } // namespace gated_delta_net

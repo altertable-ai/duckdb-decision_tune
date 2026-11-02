@@ -43,6 +43,10 @@ onnxruntime loads from the library custom_ops/build.sh builds:
 - each MLP's activation is one `decide_onnx.SwiGlu` node (src/elementwise.cpp), which reads the fused gate and up
   projection in place;
 - each residual connection and the RMSNorm after it are one `decide_onnx.AddRmsNorm` node (src/elementwise.cpp).
+These graphs also take and return a cache (CachedDecoder): a prompt can continue from the cache of its first part, so
+that the system turn is computed once for every prompt and a state once for all its questions
+(onejev_prompt.render_parts). On the 216 ticket decisions (3 questions per state), that is 44% fewer tokens. They are
+checked both on whole prompts and through the cache.
 
 Usage: uv run python -I export_onejev.py [--out out/onejev] [--skip-export] [--custom-ops out/libdecide_onnx_ops.dylib]
 """
@@ -94,10 +98,14 @@ LINEAR_ATTENTION = contrib_op("LinearAttention",
 # The extension's fused Gated DeltaNet token mixer (src/include/decide_onnx/gated_delta_net.hpp).
 CUSTOM_DOMAIN = "decide_onnx"
 GATED_DELTA_NET_MIXER = contrib_op("GatedDeltaNetMixer",
-                                   {"projection": "T", "taps": "T", "neg_a": "T", "dt_bias": "T", "norm_weight": "T"},
-                                   {}, domain=CUSTOM_DOMAIN)
+                                   {"projection": "T", "lengths": "M", "taps": "T", "neg_a": "T", "dt_bias": "T",
+                                    "norm_weight": "T", "past_state": "T", "past_conv": "T"},
+                                   {}, outputs=("output", "present_state", "present_conv"), domain=CUSTOM_DOMAIN)
 # The extension's causal attention (src/include/decide_onnx/causal_attention.hpp).
-CAUSAL_ATTENTION = contrib_op("CausalAttention", {"query": "T", "key": "T", "value": "T"}, {}, domain=CUSTOM_DOMAIN)
+CAUSAL_ATTENTION = contrib_op("CausalAttention",
+                              {"query": "T", "key": "T", "value": "T", "lengths": "M", "past_key": "T",
+                               "past_value": "T", "past_lengths": "M"},
+                              {}, outputs=("output", "present_key", "present_value"), domain=CUSTOM_DOMAIN)
 # The extension's MLP activation and residual norm (src/include/decide_onnx/elementwise.hpp).
 SWIGLU = contrib_op("SwiGlu", {"x": "T"}, {}, domain=CUSTOM_DOMAIN)
 ADD_RMS_NORM = contrib_op("AddRmsNorm", {"x": "T", "delta": "T", "weight": "T"}, {}, outputs=("sum", "normed"),
@@ -171,21 +179,40 @@ def onnx_causal_attention(q, k, v, seqlens_k, total_length, num_heads: int, kv_n
 
 
 @torch.library.custom_op("onejev::blocked_causal_attention", mutates_args=())
-def blocked_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Causal grouped-query attention over [B, T, heads, dim] q and [B, T, kv_heads, dim] k and v, scaled by
-    dim^-0.5. Exported as decide_onnx.CausalAttention, the extension's CPU kernel."""
-    out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True,
-                                         enable_gqa=True)
-    return out.transpose(1, 2).contiguous()
+def blocked_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lengths: torch.Tensor,
+                             past_key: torch.Tensor, past_value: torch.Tensor,
+                             past_lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Causal grouped-query attention over each row's first `lengths` tokens of [B, T, heads, dim] q and
+    [B, T, kv_heads, dim] k and v, after its first `past_lengths` cached keys and values [B, P, kv_heads, dim]; scaled
+    by dim^-0.5. Returns the output (zeros past each row's length) and the keys and values [B, P + T, kv_heads, dim]
+    for the tokens after it: the cached ones, the row's, then zeros. Exported as decide_onnx.CausalAttention, the
+    extension's CPU kernel."""
+    batch, length = q.shape[:2]
+    out = torch.zeros_like(q)
+    keys = q.new_zeros(batch, past_key.shape[1] + length, *k.shape[2:])
+    values = torch.zeros_like(keys)
+    for row in range(batch):
+        n, cached = int(lengths[row]), int(past_lengths[row])
+        keys[row, :cached + n] = torch.cat([past_key[row, :cached], k[row, :n]])
+        values[row, :cached + n] = torch.cat([past_value[row, :cached], v[row, :n]])
+        if n:
+            # Query i is token cached + i: it sees the keys up to that one.
+            mask = torch.ones(n, cached + n, dtype=torch.bool).tril(cached)
+            heads = lambda x: x.transpose(0, 1)[None]
+            out[row, :n] = F.scaled_dot_product_attention(
+                heads(q[row, :n]), heads(keys[row, :cached + n]), heads(values[row, :cached + n]), attn_mask=mask,
+                enable_gqa=True)[0].transpose(0, 1)
+    return out, keys, values
 
 
 @blocked_causal_attention.register_fake
-def _(q, k, v):
-    return torch.empty_like(q)
+def _(q, k, v, lengths, past_key, past_value, past_lengths):
+    keys = q.new_empty(q.shape[0], past_key.shape[1] + q.shape[1], *k.shape[2:])
+    return torch.empty_like(q), keys, torch.empty_like(keys)
 
 
-def onnx_blocked_causal_attention(q, k, v):
-    return CAUSAL_ATTENTION(q, k, v)
+def onnx_blocked_causal_attention(q, k, v, lengths, past_key, past_value, past_lengths):
+    return CAUSAL_ATTENTION(q, k, v, lengths, past_key, past_value, past_lengths)
 
 
 @torch.library.custom_op("onejev::gated_delta_rule", mutates_args=())
@@ -237,26 +264,47 @@ def mixer(mixed_qkv, a, b, taps, neg_a, dt_bias, heads: int):
 
 
 @torch.library.custom_op("onejev::gated_delta_net_mixer", mutates_args=())
-def gated_delta_net_mixer(projection: torch.Tensor, taps: torch.Tensor, neg_a: torch.Tensor, dt_bias: torch.Tensor,
-                          norm_weight: torch.Tensor) -> torch.Tensor:
-    """A Gated DeltaNet layer between its input and output projections, as one op: the [B, T, C + H * D + 2 * H]
-    projection holds mixed_qkv, z, b and a. Exported as decide_onnx.GatedDeltaNetMixer, the extension's CPU kernel: the
-    conv, norms and gates in one pass, the delta rule in chunks of 64 tokens on GEMMs, and the gated norm."""
-    heads, dim = neg_a.shape[0], norm_weight.shape[0]
-    qkv, z, b, a = projection.split([3 * heads * dim, heads * dim, heads, heads], dim=-1)
-    batch, length = projection.shape[:2]
-    out = rms_norm(mixer(qkv, a, b, taps, neg_a, dt_bias, heads).reshape(batch, length, heads, dim), norm_weight,
-                   CUSTOM_OPS_NORM_EPS)
-    return (out * F.silu(z.reshape(batch, length, heads, dim))).reshape(batch, length, heads * dim)
+def gated_delta_net_mixer(projection: torch.Tensor, lengths: torch.Tensor, taps: torch.Tensor, neg_a: torch.Tensor,
+                          dt_bias: torch.Tensor, norm_weight: torch.Tensor, past_state: torch.Tensor,
+                          past_conv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A Gated DeltaNet layer between its input and output projections, over each row's first `lengths` tokens of the
+    [B, T, C + H * D + 2 * H] projection (mixed_qkv, z, b and a), after the tokens that left past_state [B, H, D, D]
+    (the delta rule's state) and past_conv [B, K - 1, C] (the conv's last input rows); both are zeros at the start of
+    a sequence. Returns the output (zeros past each row's length) and the state and conv rows after the row. Exported
+    as decide_onnx.GatedDeltaNetMixer, the extension's CPU kernel: the conv, norms and gates in one pass, the delta
+    rule in chunks of 64 tokens on GEMMs, and the gated norm."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
+
+    heads, dim, kept = neg_a.shape[0], norm_weight.shape[0], taps.shape[0] - 1
+    out = projection.new_zeros(*projection.shape[:2], heads * dim)
+    states, convs = past_state.clone(), past_conv.clone()
+    for row in range(projection.shape[0]):
+        n = int(lengths[row])
+        if n == 0:
+            continue
+        qkv, z, b, a = projection[row:row + 1, :n].split([3 * heads * dim, heads * dim, heads, heads], dim=-1)
+        history = torch.cat([past_conv[row:row + 1], qkv], dim=1)  # the conv's input, from the cached rows
+        y = F.silu(sum(history[:, j:j + n] * taps[j] for j in range(kept + 1)))
+        q, k, v = y.split(heads * dim, dim=-1)
+        per_head = lambda x: x.reshape(1, n, heads, dim)
+        o, states[row:row + 1] = torch_chunk_gated_delta_rule(
+            per_head(l2_normalize(q, heads)), per_head(l2_normalize(k, heads)), per_head(v),
+            g=neg_a * F.softplus(a + dt_bias), beta=b.sigmoid(), initial_state=past_state[row:row + 1],
+            output_final_state=True)
+        o = rms_norm(o.reshape(1, n, heads, dim), norm_weight, CUSTOM_OPS_NORM_EPS) * F.silu(per_head(z))
+        out[row, :n] = o.reshape(n, heads * dim)
+        convs[row] = history[0, -kept:]
+    return out, states, convs
 
 
 @gated_delta_net_mixer.register_fake
-def _(projection, taps, neg_a, dt_bias, norm_weight):
-    return projection.new_empty(projection.shape[0], projection.shape[1], neg_a.shape[0] * norm_weight.shape[0])
+def _(projection, lengths, taps, neg_a, dt_bias, norm_weight, past_state, past_conv):
+    out = projection.new_empty(projection.shape[0], projection.shape[1], neg_a.shape[0] * norm_weight.shape[0])
+    return out, torch.empty_like(past_state), torch.empty_like(past_conv)
 
 
-def onnx_gated_delta_net_mixer(projection, taps, neg_a, dt_bias, norm_weight):
-    return GATED_DELTA_NET_MIXER(projection, taps, neg_a, dt_bias, norm_weight)
+def onnx_gated_delta_net_mixer(projection, lengths, taps, neg_a, dt_bias, norm_weight, past_state, past_conv):
+    return GATED_DELTA_NET_MIXER(projection, lengths, taps, neg_a, dt_bias, norm_weight, past_state, past_conv)
 
 
 @torch.library.custom_op("onejev::swiglu", mutates_args=())
@@ -294,13 +342,11 @@ def onnx_add_rms_norm(x, delta, weight):
 class Decoder(torch.nn.Module):
     """OneJev's text decoder and letter readout on concatenated copies of the reference weights."""
 
-    def __init__(self, model, slots: list[int], custom_ops: bool = False):
+    def __init__(self, model, slots: list[int]):
         super().__init__()
-        self.custom_ops = custom_ops
         lm = model.model.language_model
         cfg = self.config = lm.config
         self.eps = cfg.rms_norm_eps
-        assert not custom_ops or self.eps == CUSTOM_OPS_NORM_EPS
         self.embed = lm.embed_tokens.weight.detach()
         self.slot_rows = model.get_output_embeddings().weight.detach()[slots].T.contiguous()  # [hidden, 26]
         self.final_norm = 1.0 + lm.norm.weight.detach()
@@ -335,8 +381,6 @@ class Decoder(torch.nn.Module):
                                     at.k_proj.weight.detach(), at.v_proj.weight.detach()]).T.contiguous(),
                     q_norm=1.0 + at.q_norm.weight.detach(), k_norm=1.0 + at.k_norm.weight.detach(),
                     scale=at.scaling, out=at.o_proj.weight.detach().T.contiguous())
-                # decide_onnx.CausalAttention scales by head_dim^-0.5, as Qwen3.5 does.
-                assert not custom_ops or abs(at.scaling - self.head_dim ** -0.5) < 1e-9
             self.layers.append(spec)
         # Register every tensor so that the export stores them as initializers.
         for i, spec in enumerate(self.layers):
@@ -359,77 +403,150 @@ class Decoder(torch.nn.Module):
         total_length = torch.tensor(length, dtype=torch.int32)
         last = lengths - 1
         rows = torch.arange(batch)
-        delta = None  # the previous layer's MLP output, which the next norm adds to h
+        for i, spec in enumerate(self.layers):
+            final = i == len(self.layers) - 1
+            x = rms_norm(h, spec["in_norm"], self.eps)
+            if spec["type"] == "linear_attention":
+                heads, key_dim, value_dim = spec["heads"], spec["key_dim"], spec["value_dim"]
+                qkv, z, b, a = (x @ spec["proj"]).split([2 * key_dim + value_dim, value_dim, heads, heads], dim=-1)
+                out = mixer(qkv, a, b, spec["taps"], spec["neg_a"], spec["dt_bias"], heads)
+                out = rms_norm(out.reshape(batch, length, heads, -1), spec["out_norm"], self.eps)
+                out = (out * F.silu(z.reshape(batch, length, heads, -1))).reshape(batch, length, -1)
+            else:
+                q, gate, k, v = self.attention_inputs(x, spec)
+                q = rotary_embedding(q, position_ids, cos, sin, self.heads, self.rotary_dim)
+                k = rotary_embedding(k, position_ids, cos, sin, self.kv_heads, self.rotary_dim)
+                out = causal_attention(q, k, v, seqlens_k, total_length, self.heads, self.kv_heads, spec["scale"])
+                out = out * gate.sigmoid()
+            if final:
+                # Only each prompt's last token is read: the rest of the last layer runs on those rows alone.
+                h, out = h[rows, last], out[rows, last]
+            h = h + out @ spec["out"]
+            x = rms_norm(h, spec["post_norm"], self.eps)
+            gate, up = (x @ spec["gate_up"]).chunk(2, dim=-1)
+            h = h + (F.silu(gate) * up) @ spec["down"]
+        return rms_norm(h, self.final_norm, self.eps) @ self.slot_rows
+
+    def attention_inputs(self, x, spec):
+        """q, gate, k and v of an attention layer from its normed input; q and k after their per-head RMSNorm."""
+        batch, length, hd = x.shape[0], x.shape[1], self.head_dim
+        q, gate, k, v = (x @ spec["proj"]).split(
+            [self.heads * hd, self.heads * hd, self.kv_heads * hd, self.kv_heads * hd], dim=-1)
+        q = rms_norm(q.reshape(batch, length, self.heads, hd), spec["q_norm"], self.eps).reshape(q.shape)
+        k = rms_norm(k.reshape(batch, length, self.kv_heads, hd), spec["k_norm"], self.eps).reshape(k.shape)
+        return q, gate, k, v
+
+
+class CachedDecoder(Decoder):
+    """The decoder on the extension's own kernels (decide_onnx.GatedDeltaNetMixer, CausalAttention, SwiGlu and
+    AddRmsNorm), which continues from the cache an earlier run left and returns the cache for the tokens after it:
+
+        input_ids     int64 [B, T]   the prompts' next tokens, each followed by padding up to T
+        lengths       int64 [B]      how many of them each row has
+        past_lengths  int64 [B]      how many tokens each row's cache holds
+        past_*                       the cache (CACHE_NAMES); zeros, and P = 0, at the start of a sequence
+        -> logits  float32 [B, 26]   the letter logits at each row's last token
+           present_*                 the cache after each row's tokens, with past_lengths + lengths tokens
+
+    The cache of a row is, for each Gated DeltaNet layer, its delta rule's state (state [B, 16, 128, 128]) and its
+    conv's last 3 input rows (conv [B, 3, 6144]); for each attention layer, the keys and values of its tokens (key and
+    value [B, P, 2, 256], right-padded). A prompt cut after its system turn or its state can reuse the cache of that
+    part across prompts (onejev_prompt.render_parts)."""
+
+    def __init__(self, model, slots: list[int]):
+        super().__init__(model, slots)
+        # The custom kernels hardcode these, as Qwen3.5 sets them.
+        assert self.eps == CUSTOM_OPS_NORM_EPS
+        assert all(spec["type"] == "linear_attention" or abs(spec["scale"] - self.head_dim ** -0.5) < 1e-9
+                   for spec in self.layers)
+
+    def cache_names(self) -> list[str]:
+        """The cache tensors, in input (past_*) and output (present_*) order."""
+        names = []
+        for i, spec in enumerate(self.layers):
+            names += [f"state_{i}", f"conv_{i}"] if spec["type"] == "linear_attention" else [f"key_{i}", f"value_{i}"]
+        return names
+
+    def forward(self, input_ids, lengths, past_lengths, *past):
+        batch, length = input_ids.shape
+        cache = dict(zip(self.cache_names(), past))
+        cached = next(v for name, v in cache.items() if name.startswith("key_")).shape[1]
+        h = F.embedding(input_ids, self.embed)
+        position_ids = past_lengths[:, None] + torch.arange(length)[None]
+        freqs = torch.arange(cached + length, dtype=torch.float32)[:, None] * self.inv_freq[None, :]
+        cos, sin = freqs.cos(), freqs.sin()
+        last = lengths - 1
+        rows = torch.arange(batch)
+        present, delta = [], None  # delta: the previous layer's MLP output, which the next norm adds to h
         for i, spec in enumerate(self.layers):
             final = i == len(self.layers) - 1
             if delta is None:
                 x = rms_norm(h, spec["in_norm"], self.eps)
             else:
-                h, x = self.add_norm(h, delta, spec["in_norm"])
+                h, x = add_rms_norm(h, delta, spec["in_norm"])
             if spec["type"] == "linear_attention":
-                heads, key_dim, value_dim = spec["heads"], spec["key_dim"], spec["value_dim"]
-                if self.custom_ops:
-                    out = gated_delta_net_mixer(x @ spec["proj"], spec["taps"], spec["neg_a"], spec["dt_bias"],
-                                                spec["out_norm"])
-                else:
-                    qkv, z, b, a = (x @ spec["proj"]).split([2 * key_dim + value_dim, value_dim, heads, heads], dim=-1)
-                    out = mixer(qkv, a, b, spec["taps"], spec["neg_a"], spec["dt_bias"], heads)
-                    out = rms_norm(out.reshape(batch, length, heads, -1), spec["out_norm"], self.eps)
-                    out = (out * F.silu(z.reshape(batch, length, heads, -1))).reshape(batch, length, -1)
+                out, state, conv = gated_delta_net_mixer(x @ spec["proj"], lengths, spec["taps"], spec["neg_a"],
+                                                         spec["dt_bias"], spec["out_norm"], cache[f"state_{i}"],
+                                                         cache[f"conv_{i}"])
+                present += [state, conv]
             else:
-                hd = self.head_dim
-                q, gate, k, v = (x @ spec["proj"]).split(
-                    [self.heads * hd, self.heads * hd, self.kv_heads * hd, self.kv_heads * hd], dim=-1)
-                q = rms_norm(q.reshape(batch, length, self.heads, hd), spec["q_norm"], self.eps).reshape(q.shape)
-                k = rms_norm(k.reshape(batch, length, self.kv_heads, hd), spec["k_norm"], self.eps).reshape(k.shape)
+                q, gate, k, v = self.attention_inputs(x, spec)
                 q = rotary_embedding(q, position_ids, cos, sin, self.heads, self.rotary_dim)
                 k = rotary_embedding(k, position_ids, cos, sin, self.kv_heads, self.rotary_dim)
-                if self.custom_ops:
-                    split = lambda x, h: x.reshape(batch, length, h, hd)
-                    out = blocked_causal_attention(split(q, self.heads), split(k, self.kv_heads),
-                                                   split(v, self.kv_heads)).reshape(q.shape)
-                else:
-                    out = causal_attention(q, k, v, seqlens_k, total_length, self.heads, self.kv_heads,
-                                           spec["scale"])
-                out = out * gate.sigmoid()
+                per_head = lambda t, n: t.reshape(batch, length, n, self.head_dim)
+                out, key, value = blocked_causal_attention(
+                    per_head(q, self.heads), per_head(k, self.kv_heads), per_head(v, self.kv_heads), lengths,
+                    cache[f"key_{i}"], cache[f"value_{i}"], past_lengths)
+                out = out.reshape(q.shape) * gate.sigmoid()
+                present += [key, value]
             if final:
-                # Only each prompt's last token is read: the rest of the last layer runs on those rows alone.
                 h, out = h[rows, last], out[rows, last]
-            h, x = self.add_norm(h, out @ spec["out"], spec["post_norm"])
-            if self.custom_ops:
-                act = swiglu(x @ spec["gate_up"])
+            h, x = add_rms_norm(h, out @ spec["out"], spec["post_norm"])
+            delta = swiglu(x @ spec["gate_up"]) @ spec["down"]
+        return (add_rms_norm(h, delta, self.final_norm)[1] @ self.slot_rows, *present)
+
+
+TRANSLATIONS = {torch.ops.onejev.rotary_embedding.default: onnx_rotary_embedding,
+                torch.ops.onejev.causal_attention.default: onnx_causal_attention,
+                torch.ops.onejev.blocked_causal_attention.default: onnx_blocked_causal_attention,
+                torch.ops.onejev.gated_delta_rule.default: onnx_gated_delta_rule,
+                torch.ops.onejev.gated_delta_net_mixer.default: onnx_gated_delta_net_mixer,
+                torch.ops.onejev.swiglu.default: onnx_swiglu,
+                torch.ops.onejev.add_rms_norm.default: onnx_add_rms_norm}
+
+
+def export_graph(model, slots, path: Path, cached: bool = False) -> None:
+    """The portable graph, or with `cached` the graph on the extension's kernels with a cache (CachedDecoder)."""
+    batch = torch.export.Dim("batch", min=1, max=1024)
+    length = torch.export.Dim("length", min=2, max=262144)
+    tokens = (torch.randint(100, 40000, (2, 70)), torch.tensor([70, 50]))
+    if not cached:
+        decoder, example, names, outputs = Decoder(model, slots), tokens, INPUT_NAMES, OUTPUT_NAMES
+        dynamic = {"input_ids": {0: batch, 1: length}, "lengths": {0: batch}}
+    else:
+        decoder = CachedDecoder(model, slots)
+        past = torch.export.Dim("past", min=0, max=262144)
+        # torch.export sees *past as one input: its shapes go in one tuple.
+        example, dynamic = tokens + (torch.tensor([5, 3]),), []
+        for name in decoder.cache_names():
+            spec = decoder.layers[int(name.split("_")[1])]
+            if name.startswith(("key_", "value_")):
+                example += (torch.randn(2, 5, decoder.kv_heads, decoder.head_dim),)
+                dynamic.append({0: batch, 1: past})
+            elif name.startswith("state_"):
+                dim = spec["value_dim"] // spec["heads"]
+                example += (torch.randn(2, spec["heads"], dim, dim) * 0.1,)
+                dynamic.append({0: batch})
             else:
-                gate, up = (x @ spec["gate_up"]).chunk(2, dim=-1)
-                act = F.silu(gate) * up
-            delta = act @ spec["down"]
-        return self.add_norm(h, delta, self.final_norm)[1] @ self.slot_rows
-
-    def add_norm(self, h, delta, weight):
-        """h + delta, and its RMSNorm."""
-        if self.custom_ops:
-            return add_rms_norm(h, delta, weight)
-        h = h + delta
-        return h, rms_norm(h, weight, self.eps)
-
-
-def export_graph(model, slots, path: Path, custom_ops: bool = False) -> None:
-    decoder = Decoder(model, slots, custom_ops).eval()
-    batch_dim = torch.export.Dim("batch", min=1, max=1024)
-    length_dim = torch.export.Dim("length", min=2, max=262144)
-    example = (torch.randint(100, 40000, (2, 70)), torch.tensor([70, 50]))
+                example += (torch.randn(2, spec["taps"].shape[0] - 1, spec["taps"].shape[1]),)
+                dynamic.append({0: batch})
+        names = INPUT_NAMES + ["past_lengths"] + [f"past_{n}" for n in decoder.cache_names()]
+        outputs = OUTPUT_NAMES + [f"present_{n}" for n in decoder.cache_names()]
+        dynamic = ({0: batch, 1: length}, {0: batch}, {0: batch}, tuple(dynamic))
     with torch.inference_mode():
         program = torch.onnx.export(
-            decoder, example, dynamo=True, opset_version=21, input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
-            custom_translation_table={torch.ops.onejev.rotary_embedding.default: onnx_rotary_embedding,
-                                      torch.ops.onejev.causal_attention.default: onnx_causal_attention,
-                                      torch.ops.onejev.blocked_causal_attention.default: onnx_blocked_causal_attention,
-                                      torch.ops.onejev.gated_delta_rule.default: onnx_gated_delta_rule,
-                                      torch.ops.onejev.gated_delta_net_mixer.default: onnx_gated_delta_net_mixer,
-                                      torch.ops.onejev.swiglu.default: onnx_swiglu,
-                                      torch.ops.onejev.add_rms_norm.default: onnx_add_rms_norm},
-            dynamic_shapes={"input_ids": {0: batch_dim, 1: length_dim}, "lengths": {0: batch_dim}},
-            external_data=True,
-        )
+            decoder.eval(), example, dynamo=True, opset_version=21, input_names=names, output_names=outputs,
+            custom_translation_table=TRANSLATIONS, dynamic_shapes=dynamic, external_data=True)
     program.save(str(path), external_data=True)
 
 
@@ -472,6 +589,32 @@ def batch_feed(prompts, pad_id):
     return {"input_ids": ids, "lengths": np.array([len(p) for p in prompts], np.int64)}
 
 
+def empty_cache(session, batch: int) -> dict:
+    """A cached graph's cache inputs at the start of a sequence, for `batch` rows; nothing for other graphs."""
+    cache = {}
+    for i in session.get_inputs():
+        if i.name == "past_lengths":
+            cache[i.name] = np.zeros(batch, np.int64)
+        elif i.name.startswith("past_"):
+            cache[i.name] = np.zeros([batch] + [0 if isinstance(d, str) else d for d in i.shape[1:]], np.float32)
+    return cache
+
+
+def run_cached(session, prompts, pad_id, cache: dict) -> tuple[np.ndarray, dict]:
+    """Run a cached graph on the next tokens of each row after `cache`; return the logits and the cache they leave."""
+    feed = batch_feed(prompts, pad_id) | cache
+    outputs = session.run(None, feed)
+    after = {"past_lengths": cache["past_lengths"] + feed["lengths"]}
+    for output, value in zip(session.get_outputs()[1:], outputs[1:]):
+        after["past_" + output.name.removeprefix("present_")] = value
+    return outputs[0], after
+
+
+def take(cache: dict, rows: list[int]) -> dict:
+    """The cache of the given rows, in that order (a row may repeat)."""
+    return {name: value[rows] for name, value in cache.items()}
+
+
 def make_session(path: Path, threads: int = 0, custom_ops: Path | None = None):
     """A CPU session; `custom_ops` is the library of the extension's ops (custom_ops/build.sh), for fused graphs."""
     options = ort.SessionOptions()
@@ -490,18 +633,56 @@ def verify_graph(model, tokenizer, slots, path: Path, tolerance: float, custom_o
     alone = []
     for ids in prompts:
         expected = reference_logits(model, slots, ids)
-        logits = session.run(None, batch_feed([ids], tokenizer.pad_token_id))[0][0]
+        logits = session.run(None, batch_feed([ids], tokenizer.pad_token_id) | empty_cache(session, 1))[0][0]
         alone.append(logits)
         err = float(np.abs(logits - expected).max())
         print(f"  verify T={len(ids)}: max abs logit err {err:.3e}")
         if not err <= tolerance:
             raise SystemExit(f"verification failed for {path.name}: T={len(ids)}")
     short = [i for i, p in enumerate(prompts) if len(p) <= 256]
-    logits = session.run(None, batch_feed([prompts[i] for i in short], tokenizer.pad_token_id))[0]
+    logits = session.run(None, batch_feed([prompts[i] for i in short], tokenizer.pad_token_id)
+                         | empty_cache(session, len(short)))[0]
     drift = float(np.abs(logits - np.stack([alone[i] for i in short])).max())
     print(f"  verify batch of {len(short)}: {drift:.3e} from each prompt alone")
     if not drift <= VERIFY_BATCH_DRIFT:
         raise SystemExit(f"verification failed for {path.name}: batch")
+
+
+def cached_parts(tokenizer):
+    """The verification chat prompts cut for the cache: the system turn's tokens, each state's, and each question's
+    with the index of its state."""
+    encode = lambda text: tokenizer.encode(text, add_special_tokens=False)
+    parts = [onejev_prompt.render_parts(tokenizer, s, q)[0] for s in VERIFY_STATES for q in VERIFY_QUESTIONS]
+    states = [encode(p[1]) for p in parts[::len(VERIFY_QUESTIONS)]]
+    questions = [(encode(p[2]), i // len(VERIFY_QUESTIONS)) for i, p in enumerate(parts)]
+    return encode(parts[0][0]), states, questions
+
+
+def run_parts(session, pad_id, system, states, questions) -> np.ndarray:
+    """Each question's logits through the cache: the system turn once, each state once after it, each question after
+    its state."""
+    _, cache = run_cached(session, [system], pad_id, empty_cache(session, 1))
+    _, cache = run_cached(session, states, pad_id, take(cache, [0] * len(states)))
+    logits, _ = run_cached(session, [q for q, _ in questions], pad_id, take(cache, [i for _, i in questions]))
+    return logits
+
+
+def verify_cache(model, tokenizer, slots, path: Path, tolerance: float, custom_ops: Path) -> None:
+    """Run the verification chat prompts through the cache (run_parts) and compare each question's logits with the
+    unmodified transformers model on the whole prompt. Raise on mismatch."""
+    session = make_session(path, custom_ops=custom_ops)
+    system, states, questions = cached_parts(tokenizer)
+    logits = run_parts(session, tokenizer.pad_token_id, system, states, questions)
+    whole = verify_prompts(tokenizer)[:len(questions)]
+    worst = 0.0
+    for (question, state), ids, row in zip(questions, whole, logits):
+        if system + states[state] + question != ids:
+            raise SystemExit("the cut prompt does not tokenize to the whole prompt's tokens")
+        worst = max(worst, float(np.abs(row - reference_logits(model, slots, ids)).max()))
+    print(f"  verify cache (system turn, {len(states)} states, {len(questions)} questions): max abs logit err "
+          f"{worst:.3e}")
+    if not worst <= tolerance:
+        raise SystemExit(f"verification failed for {path.name}: cache")
 
 
 def store_int8(src: Path, dst: Path, keep_fp32_inputs: tuple[int, ...] = ()) -> None:
@@ -566,17 +747,40 @@ def store_int8(src: Path, dst: Path, keep_fp32_inputs: tuple[int, ...] = ()) -> 
 
 
 def benchmark(path: Path, tokenizer, custom_ops: Path | None = None) -> None:
-    """One thread: one prompt alone, and the ten verification chat prompts as one batch."""
+    """One thread: one prompt alone, and the ten verification chat prompts as one batch; for a cached graph, also
+    the ten one at a time, without and with the cache."""
     session = make_session(path, threads=1, custom_ops=custom_ops)
     prompts = verify_prompts(tokenizer)[:len(VERIFY_STATES) * len(VERIFY_QUESTIONS)]
-    for label, feed in [(f"one prompt, T={len(prompts[0])}", batch_feed(prompts[:1], tokenizer.pad_token_id)),
-                        (f"batch of {len(prompts)}, T={max(map(len, prompts))}", batch_feed(prompts, tokenizer.pad_token_id))]:
+    pad = tokenizer.pad_token_id
+    for label, batch in [(f"one prompt, T={len(prompts[0])}", prompts[:1]),
+                         (f"batch of {len(prompts)}, T={max(map(len, prompts))}", prompts)]:
+        feed = batch_feed(batch, pad) | empty_cache(session, len(batch))
         session.run(None, feed)
         n, start = 5, time.perf_counter()
         for _ in range(n):
             session.run(None, feed)
         ms = (time.perf_counter() - start) / n * 1000
-        print(f"  1 thread, {label}: {ms:.1f} ms ({ms / len(feed['lengths']):.1f} ms per prompt)")
+        print(f"  1 thread, {label}: {ms:.1f} ms ({ms / len(batch):.1f} ms per prompt)")
+    if "past_lengths" not in {i.name for i in session.get_inputs()}:
+        return
+    system, states, questions = cached_parts(tokenizer)
+
+    def one_by_one(cached: bool) -> float:
+        start = time.perf_counter()
+        if cached:
+            _, first = run_cached(session, [system], pad, empty_cache(session, 1))
+            for state in range(len(states)):
+                _, cache = run_cached(session, [states[state]], pad, first)
+                for question, _ in (q for q in questions if q[1] == state):
+                    run_cached(session, [question], pad, cache)
+        else:
+            for ids in prompts:
+                session.run(None, batch_feed([ids], pad) | empty_cache(session, 1))
+        return (time.perf_counter() - start) * 1000 / len(prompts)
+
+    one_by_one(True)
+    print(f"  1 thread, the {len(prompts)} prompts one at a time: {one_by_one(False):.1f} ms per prompt without the "
+          f"cache, {one_by_one(True):.1f} ms with it ({len(questions) // len(states)} questions per state)")
 
 
 def main() -> None:
@@ -584,9 +788,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "out" / "onejev")
     parser.add_argument("--skip-export", action="store_true", help="reuse model_fp32.onnx")
     parser.add_argument("--custom-ops", type=Path, metavar="LIBRARY",
-                        help="also write model_fused_fp32.onnx and model_fused.onnx, which run the extension's "
-                             "decide_onnx.GatedDeltaNetMixer and decide_onnx.CausalAttention, and check them with "
-                             "LIBRARY (out/libdecide_onnx_ops.*, from custom_ops/build.sh)")
+                        help="also write model_fused_fp32.onnx and model_fused.onnx, which run on the extension's "
+                             "decide_onnx ops with a cache (CachedDecoder), and check them with LIBRARY "
+                             "(out/libdecide_onnx_ops.*, from custom_ops/build.sh)")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -607,10 +811,12 @@ def main() -> None:
         print("exporting on the extension's custom ops")
         fused_fp32, fused = args.out / "model_fused_fp32.onnx", args.out / "model_fused.onnx"
         if not args.skip_export:
-            export_graph(model, slots, fused_fp32, custom_ops=True)
+            export_graph(model, slots, fused_fp32, cached=True)
         verify_graph(model, tokenizer, slots, fused_fp32, VERIFY_TOLERANCE, args.custom_ops)
+        verify_cache(model, tokenizer, slots, fused_fp32, VERIFY_TOLERANCE, args.custom_ops)
         store_int8(fused_fp32, fused)
         verify_graph(model, tokenizer, slots, fused, VERIFY_INT8_TOLERANCE, args.custom_ops)
+        verify_cache(model, tokenizer, slots, fused, VERIFY_INT8_TOLERANCE, args.custom_ops)
         benchmark(fused, tokenizer, args.custom_ops)
     print(f"wrote {args.out}")
 

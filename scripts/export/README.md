@@ -109,6 +109,12 @@ CPU kernels, registered by `src/custom_ops.cpp`:
   place, and `decide_onnx.AddRmsNorm` each residual connection with the RMSNorm after it, in one pass instead of an
   `Add` and a `SimplifiedLayerNormalization`, which take about 2.5 times as long on ONNX Runtime's CPU kernels.
 
+These graphs also take and return a cache: each Gated DeltaNet layer's delta-rule state and last conv rows, and each
+attention layer's keys and values (`CachedDecoder` in `export_onejev.py` describes the inputs and outputs). A prompt
+can continue from the cache of its first part, so the 36-token system turn is computed once for every prompt and a
+state once for all its questions (`onejev_prompt.render_parts` cuts a prompt there). The export checks the graphs on
+whole prompts and through the cache.
+
 The GEMMs and exps run on Accelerate on Apple platforms and on ONNX Runtime's MLAS elsewhere (`src/cpu_backend.cpp`).
 Python's onnxruntime loads the ops from a library that `custom_ops/build.sh` builds from the same sources, after
 `make release`:
