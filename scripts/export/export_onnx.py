@@ -1,8 +1,11 @@
-"""Export the vela3-fast decision backbone to ONNX for the decide_onnx DuckDB extension.
+"""Export the vela3-fast-multilingual decision backbone to ONNX for the decide_onnx DuckDB extension.
 
 vela3-fast (https://huggingface.co/vllm-sr/vela3-fast, Apache-2.0) answers choice and yes/no questions with its
-decision backbone: an UltraBERT-380M encoder and a small readout head (`vela3_encoder.DecisionEncoder`). One prompt
-is one question:
+decision backbone: an UltraBERT-380M encoder and a small readout head (`vela3_encoder.DecisionEncoder`).
+vela3-fast-multilingual is Altertable's English, French, German, Spanish and Italian fine-tune of that backbone
+(https://huggingface.co/altertable/vela3-fast-multilingual-onnx-int8, Apache-2.0): the same code, config and
+tokenizer, with its own weights (`--weights`, the fp32 `model.safetensors` of checkpoint c1-s762). One prompt is one
+question:
 
     [BOS] [Q] question [O] option_1 [O] option_2 ... [SEP_SCHEMA] [SEG_user] state [EOS]
 
@@ -43,7 +46,8 @@ the released one are checked against the unmodified `DecisionEncoder` (PyTorch, 
 Outputs land in `out/`: model_fp32.onnx, and the release: model.onnx, tokenizer.json, manifest.json and the weights'
 LICENSE. The extension's `src/include/decide_onnx/model_manifest.hpp` is regenerated.
 
-Usage: uv run python -I export_onnx.py [--out out] [--skip-export]
+Usage: uv run python -I export_onnx.py --weights model.safetensors [--out out] [--skip-export]
+  --weights       the fine-tuned fp32 weights; their SHA-256 must be WEIGHTS_SHA256
   --skip-export   reuse out/model_fp32.onnx (verified again) instead of exporting it anew; exports are not
                   byte-identical, so this rebuilds the release of an earlier run
 """
@@ -91,9 +95,15 @@ ROTARY_EMBEDDING = contrib_op("RotaryEmbedding",
                               {"input": "T", "position_ids": "M", "cos_cache": "T", "sin_cache": "T"},
                               {"num_heads": _S.AttrType.INT})
 
-ASSET_VERSION = "v5"
+ASSET_VERSION = "v6"
+MODEL_NAME = "vela3-fast-multilingual"
+# The code, config and tokenizer of the base model, which the fine-tune shares.
 HF_REPO = "vllm-sr/vela3-fast"
 HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb"
+# The published fine-tune (an int8 ONNX package) and the fp32 weights it was quantized from.
+WEIGHTS_REPO = "altertable/vela3-fast-multilingual-onnx-int8"
+WEIGHTS_REVISION = "0bfac7568f9170c3cbf975a5a218ff387940f866"
+WEIGHTS_SHA256 = "9f76a74f4c33572a98468b90dba00844663a3e6afbb9aaffde6553f85c5eb8df"
 # Everything the decision backbone needs; the span and router adapters are not used.
 HF_FILES = ["*.py", "*.json", "model.safetensors", "LICENSE", "SHA256SUMS"]
 INPUT_NAMES = ["input_ids", "position_ids", "segment_ids", "positions", "questions", "state_starts", "state_ends"]
@@ -121,13 +131,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 HEADER_PATH = REPO_ROOT / "src" / "include" / "decide_onnx" / "model_manifest.hpp"
 
 
-def load_reference():
-    """The published `DecisionEncoder` (CPU, fp32) and the snapshot directory it was loaded from."""
+def load_reference(weights: Path):
+    """The published `DecisionEncoder` (CPU, fp32) with the fine-tuned weights, and the base snapshot directory."""
+    actual = sha256_of(weights)
+    if actual != WEIGHTS_SHA256:
+        sys.exit(f"{weights}: SHA-256 {actual}, expected {WEIGHTS_SHA256}")
     path = Path(snapshot_download(HF_REPO, revision=HF_REVISION, allow_patterns=HF_FILES))
     sys.path.insert(0, str(path))
+    from safetensors.torch import load_file
     from vela3_encoder import DecisionEncoder
 
-    return DecisionEncoder.load(path, device="cpu"), path
+    reference = DecisionEncoder.load(path, device="cpu")
+    reference.load_state_dict(load_file(str(weights)), strict=True)
+    return reference.eval(), path
 
 
 def rms_norm(norm, x):
@@ -493,11 +509,11 @@ struct ModelFile {{
 	uint64_t file_bytes;
 }};
 
-static constexpr const char *MODEL_NAME = "vela3-fast";
+static constexpr const char *MODEL_NAME = "{MODEL_NAME}";
 static constexpr const char *ASSET_VERSION = "{ASSET_VERSION}";
 //! The Hugging Face repository and commit the weights come from (Apache-2.0).
-static constexpr const char *HF_REPO = "{HF_REPO}";
-static constexpr const char *HF_REVISION = "{HF_REVISION}";
+static constexpr const char *HF_REPO = "{WEIGHTS_REPO}";
+static constexpr const char *HF_REVISION = "{WEIGHTS_REVISION}";
 
 static constexpr ModelFile TOKENIZER_FILE = {{
     "tokenizer.json", "{tok["sha256"]}", {tok["file_bytes"]}ULL}};
@@ -520,13 +536,14 @@ static constexpr uint64_t PACK_PROMPT_TOKENS = {PACK_PROMPT_MAX};
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--weights", type=Path, required=True, help="the fine-tuned fp32 model.safetensors")
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "out")
     parser.add_argument("--skip-export", action="store_true", help="reuse out/model_fp32.onnx")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
-    print(f"exporting {HF_REPO}@{HF_REVISION}")
-    reference, snapshot = load_reference()
+    print(f"exporting {MODEL_NAME} ({args.weights} on {HF_REPO}@{HF_REVISION})")
+    reference, snapshot = load_reference(args.weights)
     fp32_path, onnx_path = args.out / "model_fp32.onnx", args.out / "model.onnx"
     if not args.skip_export:
         export_graph(reference, fp32_path)
@@ -540,7 +557,8 @@ def main() -> None:
     decision = json.loads((snapshot / "config.json").read_text())["decision"]
     files = [{"file_name": name, "sha256": sha256_of(args.out / name), "file_bytes": (args.out / name).stat().st_size}
              for name in ("tokenizer.json", "model.onnx")]
-    manifest = {"asset_version": ASSET_VERSION, "hf_repo": HF_REPO, "hf_revision": HF_REVISION,
+    manifest = {"asset_version": ASSET_VERSION, "model": MODEL_NAME, "hf_repo": WEIGHTS_REPO,
+                "hf_revision": WEIGHTS_REVISION, "weights_sha256": WEIGHTS_SHA256,
                 "marker_ids": decision["marker_ids"], "context_tokens": decision["max_len"], "files": files}
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     write_header(files, decision["marker_ids"], decision["max_len"])

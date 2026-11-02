@@ -1,19 +1,23 @@
-# vela3-fast ONNX export
+# vela3-fast-multilingual ONNX export
 
-These scripts turn the decision backbone of [vela3-fast](https://huggingface.co/vllm-sr/vela3-fast) into the ONNX
-graph the `decide_onnx` DuckDB extension runs, and generate the parity fixtures the extension is tested against.
-You only need them to cut a new asset version; users of the extension never run them.
+These scripts turn the decision backbone of vela3-fast-multilingual into the ONNX graph the `decide_onnx` DuckDB
+extension runs, and generate the parity fixtures the extension is tested against. vela3-fast-multilingual is
+Altertable's English, French, German, Spanish and Italian fine-tune of
+[vela3-fast](https://huggingface.co/vllm-sr/vela3-fast), published as
+[altertable/vela3-fast-multilingual-onnx-int8](https://huggingface.co/altertable/vela3-fast-multilingual-onnx-int8).
+You only need these scripts to cut a new asset version; users of the extension never run them.
 
 ```bash
 cd scripts/export
 uv sync
-uv run python -I export_onnx.py    # out/, regenerates src/include/decide_onnx/model_manifest.hpp
-uv run python make_fixtures.py     # test/data/parity/
+uv run python -I export_onnx.py --weights model.safetensors    # out/, regenerates src/include/decide_onnx/model_manifest.hpp
+uv run python make_fixtures.py --weights model.safetensors     # test/data/parity/
 ```
 
-Everything is pinned: the Hugging Face revision of vela3-fast (`HF_REVISION` in `export_onnx.py`) and the
-torch/transformers/onnx/onnxruntime versions (`uv.lock`). The export downloads about 1.5 GB (`model.safetensors`
-and the model's Python files); the span and router adapters are not needed.
+`--weights` is the fp32 `model.safetensors` of the fine-tune (checkpoint c1-s762), which the published int8 package
+was quantized from; the scripts refuse a file whose SHA-256 is not `WEIGHTS_SHA256` in `export_onnx.py`. The
+fine-tune shares vela3-fast's code, config and tokenizer, which are downloaded from Hugging Face at a pinned
+revision (`HF_REVISION`). The torch/transformers/onnx/onnxruntime versions are pinned in `uv.lock`.
 
 ## What gets exported
 

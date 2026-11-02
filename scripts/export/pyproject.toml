@@ -1,7 +1,7 @@
 [project]
 name = "decide-onnx-export"
 version = "1.0.0"
-description = "Exports the vela3-fast decision backbone to ONNX for the decide_onnx DuckDB extension"
+description = "Exports the vela3-fast-multilingual decision backbone to ONNX for the decide_onnx DuckDB extension"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "huggingface_hub",

@@ -43,7 +43,7 @@ FROM tickets DECIDE (
     CHOOSE 'Which team?' AMONG (billing 'Billing: charges, refunds', tech 'Tech support: bugs, crashes') AS team,
     ASK 'Is the customer asking for a refund?' AS refund
     GIVEN message)
-WHERE team_confidence >= 0.5 AND refund_probabilities['yes'] < 0.99;
+WHERE team_confidence >= 0.5 AND refund_probabilities['yes'] < 0.9;
 ----
 2	true
 

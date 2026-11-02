@@ -14,16 +14,16 @@ struct ModelFile {
 	uint64_t file_bytes;
 };
 
-static constexpr const char *MODEL_NAME = "vela3-fast";
-static constexpr const char *ASSET_VERSION = "v5";
+static constexpr const char *MODEL_NAME = "vela3-fast-multilingual";
+static constexpr const char *ASSET_VERSION = "v6";
 //! The Hugging Face repository and commit the weights come from (Apache-2.0).
-static constexpr const char *HF_REPO = "vllm-sr/vela3-fast";
-static constexpr const char *HF_REVISION = "078c42f90cabdac7964f8e206d95a6f3a1aafacb";
+static constexpr const char *HF_REPO = "altertable/vela3-fast-multilingual-onnx-int8";
+static constexpr const char *HF_REVISION = "0bfac7568f9170c3cbf975a5a218ff387940f866";
 
 static constexpr ModelFile TOKENIZER_FILE = {
     "tokenizer.json", "38734bb17ef19f84c67b5eb5692bea19801ffd02cb5c5ffc11429e76b0242e08", 3523470ULL};
 static constexpr ModelFile ONNX_FILE = {
-    "model.onnx", "a40ddd8c8662e05d9432f44d8f34ec11b0078375e1b709618914f251d6d33643", 452419048ULL};
+    "model.onnx", "e3df0d9118c8b7f82812e0e7fd5f77faa49785d4bf58d137d5613f2c13e3d4c8", 452419048ULL};
 static constexpr const ModelFile *MODEL_FILES[] = {&TOKENIZER_FILE, &ONNX_FILE};
 
 //! The decision markers, appended to the tokenizer's vocabulary (`decision.marker_ids` in config.json).
