@@ -313,8 +313,9 @@ void RegisterModelStore(ExtensionLoader &loader) {
 	config.AddExtensionOption("decide_onnx_model_url",
 	                          "Base URL the vela3-fast-multilingual tokenizer.json and model.onnx are downloaded from",
 	                          LogicalType::VARCHAR, Value(DEFAULT_MODEL_URL));
-	config.AddExtensionOption("decide_onnx_cache_dir", "Directory downloaded vela3-fast-multilingual files are cached in",
-	                          LogicalType::VARCHAR, Value(DEFAULT_CACHE_DIR));
+	config.AddExtensionOption("decide_onnx_cache_dir",
+	                          "Directory downloaded vela3-fast-multilingual files are cached in", LogicalType::VARCHAR,
+	                          Value(DEFAULT_CACHE_DIR));
 	config.AddExtensionOption("decide_onnx_model_path",
 	                          "Local directory with tokenizer.json and model.onnx to use instead of the download cache "
 	                          "(no checksum check)",
