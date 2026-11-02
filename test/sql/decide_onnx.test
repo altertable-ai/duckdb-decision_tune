@@ -7,12 +7,12 @@ require decide_onnx
 query II
 SELECT decide_onnx_version().onnxruntime LIKE '1.%', decide_onnx_version().model;
 ----
-true	vela3-fast
+true	vela3-fast-multilingual
 
 # (local_path uses the platform's separator: \ on Windows)
 query IIII
-SELECT file_name, file_bytes > 0, url = 'https://assets.altertable.ai/decide_onnx/v5/' || file_name,
-       replace(local_path, '\', '/') LIKE '%/decide_onnx/v5/' || file_name
+SELECT file_name, file_bytes > 0, url = 'https://assets.altertable.ai/decide_onnx/v6/' || file_name,
+       replace(local_path, '\', '/') LIKE '%/decide_onnx/v6/' || file_name
 FROM decide_onnx_models() ORDER BY file_name;
 ----
 model.onnx	true	true	true

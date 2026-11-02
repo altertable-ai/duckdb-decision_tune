@@ -16,8 +16,8 @@ namespace duckdb {
 namespace decide_onnx {
 
 //! Where scripts/export uploads the files of ASSET_VERSION.
-static constexpr const char *DEFAULT_MODEL_URL = "https://assets.altertable.ai/decide_onnx/v5";
-static constexpr const char *DEFAULT_CACHE_DIR = "~/.duckdb/decide_onnx/v5";
+static constexpr const char *DEFAULT_MODEL_URL = "https://assets.altertable.ai/decide_onnx/v6";
+static constexpr const char *DEFAULT_CACHE_DIR = "~/.duckdb/decide_onnx/v6";
 //! Next to a verified file: "<sha256> <bytes> <mtime>", so later processes skip hashing the model again.
 static constexpr const char *VERIFIED_SUFFIX = ".verified";
 static constexpr idx_t IO_CHUNK = 8 * 1024 * 1024;
@@ -180,7 +180,7 @@ static void Download(ClientContext &context, const ModelFile &file, const string
 		fs.TryRemoveFile(tmp);
 		ErrorData error(ex);
 		throw IOException("decide_onnx: could not download %s: %s. To use local files instead, SET "
-		                  "decide_onnx_model_path = '/path/to/vela3-fast-onnx'",
+		                  "decide_onnx_model_path = '/path/to/vela3-fast-multilingual-onnx'",
 		                  url, error.RawMessage());
 	}
 	auto actual = Sha256Hex(sha);
@@ -311,10 +311,11 @@ static void ModelsFunction(ClientContext &context, TableFunctionInput &data, Dat
 void RegisterModelStore(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("decide_onnx_model_url",
-	                          "Base URL the vela3-fast tokenizer.json and model.onnx are downloaded from",
+	                          "Base URL the vela3-fast-multilingual tokenizer.json and model.onnx are downloaded from",
 	                          LogicalType::VARCHAR, Value(DEFAULT_MODEL_URL));
-	config.AddExtensionOption("decide_onnx_cache_dir", "Directory downloaded vela3-fast files are cached in",
-	                          LogicalType::VARCHAR, Value(DEFAULT_CACHE_DIR));
+	config.AddExtensionOption("decide_onnx_cache_dir",
+	                          "Directory downloaded vela3-fast-multilingual files are cached in", LogicalType::VARCHAR,
+	                          Value(DEFAULT_CACHE_DIR));
 	config.AddExtensionOption("decide_onnx_model_path",
 	                          "Local directory with tokenizer.json and model.onnx to use instead of the download cache "
 	                          "(no checksum check)",

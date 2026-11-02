@@ -1,13 +1,15 @@
 # decide_onnx: decision models in DuckDB
 
-`decide_onnx` runs [vela3-fast](https://huggingface.co/vllm-sr/vela3-fast) inside DuckDB. vela3-fast is the
-0.4B member of the Vela 3.0 family from vLLM Semantic Router and KR Labs: an UltraBERT-380M encoder, Apache-2.0.
+`decide_onnx` runs [vela3-fast-multilingual](https://huggingface.co/altertable/vela3-fast-multilingual-onnx-int8)
+inside DuckDB. It is Altertable's English, French, German, Spanish and Italian fine-tune of
+[vela3-fast](https://huggingface.co/vllm-sr/vela3-fast), the 0.4B member of the Vela 3.0 family from vLLM Semantic
+Router and KR Labs: an UltraBERT-380M encoder, Apache-2.0.
 You give it a state, a question and options. It picks one option and gives a probability for each, or it gives
 P(yes) for a yes/no question. It does one encoder pass and never generates text. The extension runs the model's
 decision backbone only. The span, entity and router adapters of vela3-fast are not included.
 
 Decision models of this kind are also offered as hosted APIs, such as TypeSafe's [Jev](https://typesafe.ai) and
-OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions). vela3-fast is an open-weights
+OpenAI's [Decisions API](https://developers.openai.com/api/docs/guides/decisions). vela3-fast-multilingual is an open-weights
 model that runs on your own machine. [Compared with hosted decision APIs](#compared-with-hosted-decision-apis)
 explains the trade-offs.
 
@@ -29,9 +31,9 @@ FROM tickets DECIDE (
 
 | subject       | team     | team_confidence | team_probabilities                       | refund | refund_confidence | refund_probabilities |
 |---------------|----------|----------------:|------------------------------------------|--------|------------------:|----------------------|
-| Broken mug    | shipping | 0.72            | {billing=0.28, shipping=0.72, tech=0.01} | true   | 0.99              | {yes=0.99, no=0.01}  |
-| Double charge | billing  | 1.00            | {billing=1.00, shipping=0.00, tech=0.00} | false  | 0.89              | {yes=0.11, no=0.89}  |
-| Login loop    | tech     | 1.00            | {billing=0.00, shipping=0.00, tech=1.00} | false  | 0.94              | {yes=0.06, no=0.94}  |
+| Broken mug    | shipping | 0.81            | {billing=0.18, shipping=0.81, tech=0.01} | true   | 0.98              | {yes=0.98, no=0.02}  |
+| Double charge | billing  | 0.99            | {billing=0.99, shipping=0.00, tech=0.00} | false  | 0.81              | {yes=0.19, no=0.81}  |
+| Login loop    | tech     | 1.00            | {billing=0.00, shipping=0.00, tech=1.00} | false  | 0.93              | {yes=0.07, no=0.93}  |
 
 ## Install
 
@@ -48,11 +50,11 @@ LOAD decide_onnx;
 query ends, and this includes the connection that runs `LOAD`. So send `LOAD decide_onnx` and the first `DECIDE`
 query as two separate statements, not as one string.
 
-The first query that runs the model downloads vela3-fast from `https://assets.altertable.ai/decide_onnx/v5/`.
-That is `tokenizer.json` (3.5 MB) and `model.onnx` (452 MB), an ONNX export of the decision backbone of one pinned
-commit of the Hugging Face repository (see [scripts/export](scripts/export/README.md)). The file stores the weights
+The first query that runs the model downloads vela3-fast-multilingual from `https://assets.altertable.ai/decide_onnx/v6/`.
+That is `tokenizer.json` (3.5 MB) and `model.onnx` (452 MB), an ONNX export of the fine-tuned decision backbone, pinned
+by its SHA-256 (see [scripts/export](scripts/export/README.md)). The file stores the weights
 as int8 and fp16; ONNX Runtime turns them back into float32 when the model loads. The extension checks each
-file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v5/`. The model loads when a
+file against the SHA-256 compiled into it and caches it in `~/.duckdb/decide_onnx/v6/`. The model loads when a
 query first needs an answer, not when the query is bound, so `DESCRIBE` of a `DECIDE` query stays fast. The
 optimizer may compute a call whose arguments are all constants while it plans the query.
 
@@ -153,7 +155,7 @@ with `left(message, 20000)`, or wrap the call in `TRY(…)` to get `NULL` instea
 
 ### Writing good questions
 
-vela3-fast scores the options you give it. The quality of a decision depends on the question, the options and
+The model scores the options you give it. The quality of a decision depends on the question, the options and
 the state. These tips help:
 - **Describe every option.** `shipping 'delivery, lost or damaged packages'` usually gives better results
   than `shipping` alone.
@@ -163,7 +165,11 @@ the state. These tips help:
 - **Put only what a person would read into `GIVEN`.** Leave out ids and timestamps.
 - **Phrase yes/no questions so that yes is the case you act on.** Then threshold `name_probabilities['yes']`.
 
-vela3-fast was trained on English. The model's probabilities are not calibrated. Pick thresholds on your own
+The model answers in English, French, German, Spanish and Italian, and works best with the question and the
+option descriptions in English, whatever the language of the state. Other languages are untested. On held-out
+XNLI, PAWS-X and Belebele items with English instructions, it scores 67.3% averaged over French, German, Spanish
+and Italian, against 58.4% for vela3-fast, and 80.2% in English against 80.9%. Non-English text takes about 1.7 to
+2.1 times as many tokens as English. The model's probabilities are not calibrated. Pick thresholds on your own
 labeled rows, and send the unsure rows to a person.
 
 ## Performance
@@ -209,9 +215,9 @@ question about the same state twice is scored once, and so is a query that you r
 ### Compared with hosted decision APIs
 
 TypeSafe's Jev and OpenAI's Decisions API answer the same kind of question (pick an option, or give P(yes)) over
-HTTP. The figures below are as published in October 2026. Only the vela3-fast throughput was measured here.
+HTTP. The figures below are as published in October 2026. Only the `decide_onnx` throughput was measured here.
 
-| | `decide_onnx` (vela3-fast) | [Jev](https://openrouter.ai/docs/guides/community/jev) (TypeSafe) | [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (OpenAI) |
+| | `decide_onnx` (vela3-fast-multilingual) | [Jev](https://openrouter.ai/docs/guides/community/jev) (TypeSafe) | [Decisions API](https://developers.openai.com/api/docs/guides/decisions) (OpenAI) |
 |---|---|---|---|
 | Runs | In DuckDB, on your CPU | Hosted API | Hosted API (`gpt-6-luna`) |
 | Weights | Open, Apache-2.0, 380M parameters | Closed | Closed |
@@ -244,8 +250,10 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
     up to 400 questions per request about one shared input.
 [^techcrunch]: [TechCrunch, 22 October 2026](https://techcrunch.com/2026/10/22/openai-makes-its-jev-competitor-widely-available-as-decision-model-competition-heats-up/).
 [^board]: [Decision Index board](https://huggingface.co/spaces/multimodalart/jev-decision-index), data of 29
-    October 2026 (public panel `decision-index-0.3`). The vela3-fast numbers match its
-    [model card](https://huggingface.co/vllm-sr/vela3-fast).
+    October 2026 (public panel `decision-index-0.3`). The `decide_onnx` numbers are those of the base
+    vela3-fast and match its [model card](https://huggingface.co/vllm-sr/vela3-fast); the full Index was not run for
+    the multilingual fine-tune, which scores 52.2 against 52.0 for vela3-fast on an 11,313-row sample of the public
+    index.
 [^openrouter]: [OpenRouter Jev guide](https://openrouter.ai/docs/guides/community/jev). Requests over about 32,000
     bytes use a slower, less accurate long-context mode.
 
@@ -253,8 +261,8 @@ the vendors, and a hosted API can answer many rows at once without your CPU or m
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v5'` | The URL the files are downloaded from. A local directory also works. |
-| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v5'` | Where the downloaded files are cached. |
+| `decide_onnx_model_url` | `'https://assets.altertable.ai/decide_onnx/v6'` | The URL the files are downloaded from. A local directory also works. |
+| `decide_onnx_cache_dir` | `'~/.duckdb/decide_onnx/v6'` | Where the downloaded files are cached. |
 | `decide_onnx_model_path` | `''` | A local directory to use instead of the cache. It holds `tokenizer.json` and `model.onnx`. The files are not checksummed. |
 
 ### Offline use
@@ -272,7 +280,7 @@ To use the extension on a machine without internet access, do one of these:
 
 ## How it works
 
-- **Tokenizer.** vela3-fast uses UltraBERT's byte-level BPE tokenizer. `src/tokenizer.cpp` is a C++ port of the
+- **Tokenizer.** vela3-fast-multilingual keeps vela3-fast's tokenizer, UltraBERT's byte-level BPE tokenizer. `src/tokenizer.cpp` is a C++ port of the
   parts of Hugging Face `tokenizers` that this tokenizer uses:
   - added tokens, matched on the raw text, with their `lstrip` and `rstrip` flags
   - the GPT-2 pre-tokenizer regex
@@ -298,18 +306,19 @@ To use the extension on a machine without internet access, do one of these:
   [timestral](https://github.com/altertable-ai/duckdb-timestral)). `SET active_grammar_extensions` turns them off
   for a connection.
 
-The parity tests in `test/sql/parity_*.test` compare the extension with the published vela3-fast code, run in
+The parity tests in `test/sql/parity_*.test` compare the extension with the published vela3-fast code, run with the
+fine-tuned weights in
 PyTorch on the CPU (`scripts/export/make_fixtures.py`):
 - Token ids match exactly on 394 cases. The cases cover multilingual text, emoji, combining marks, runs of spaces,
   contractions and special tokens.
-- Probabilities match to within 0.02 on 14 decisions: choices with and without descriptions, yes/no questions, and
-  text and JSON states. The largest difference is about 0.007, from the int8 storage of the weights; the same
+- Probabilities match to within 0.02 on 16 decisions: choices with and without descriptions, yes/no questions,
+  text and JSON states, and French and German states. The largest difference is about 0.006, from the int8 storage of the weights; the same
   answer is chosen in every case.
 
 ## Limitations
 
-- vela3-fast scores options. It does not reason step by step, and its probabilities are not calibrated. It was
-  trained on English. Do not use it for high-risk decisions about people (hiring, credit, housing, health, legal)
+- The model scores options. It does not reason step by step, and its probabilities are not calibrated. It was
+  trained on English, French, German, Spanish and Italian, partly on machine-translated data. Do not use it for high-risk decisions about people (hiring, credit, housing, health, legal)
   without independent validation.
 - The ONNX graph takes one sequence at a time. Throughput comes from running many rows in parallel, not from
   batching.
@@ -321,8 +330,8 @@ PyTorch on the CPU (`scripts/export/make_fixtures.py`):
 ## Building
 
 ```bash
-git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decision_tune
-cd duckdb-decision_tune
+git clone --recurse-submodules https://github.com/altertable-ai/duckdb-decide_onnx
+cd duckdb-decide_onnx
 git clone https://github.com/microsoft/vcpkg.git ../vcpkg && ../vcpkg/bootstrap-vcpkg.sh
 export VCPKG_TOOLCHAIN_PATH=$PWD/../vcpkg/scripts/buildsystems/vcpkg.cmake
 GEN=ninja make release
@@ -342,7 +351,7 @@ Tests that need the model are skipped unless you point them at a directory that 
 `model.onnx`. The extension's own cache directory works:
 
 ```bash
-DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v5 make test
+DECIDE_ONNX_MODEL_PATH=$HOME/.duckdb/decide_onnx/v6 make test
 ```
 
 To export the model again or regenerate the parity fixtures, see [scripts/export](scripts/export/README.md).
@@ -350,7 +359,8 @@ To export the model again or regenerate the parity fixtures, see [scripts/export
 ## Licences
 
 - This extension: MIT (see `LICENSE`).
-- vela3-fast weights and tokenizer: Apache-2.0, vLLM Semantic Router and KR Labs. The ONNX graph on
-  assets.altertable.ai is an export of those weights, under the same licence, which is published next to it.
+- vela3-fast code and tokenizer: Apache-2.0, vLLM Semantic Router and KR Labs. vela3-fast-multilingual weights:
+  Apache-2.0, Altertable, fine-tuned from vela3-fast. The ONNX graph on assets.altertable.ai is an export of those
+  weights, under the same licence, which is published next to it.
 - ONNX Runtime: MIT.
 - vcpkg overlay ports, adapted from [anofox_tabfm](https://github.com/DataZooDE/anofox-tabfm): MIT.

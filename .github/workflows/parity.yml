@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   parity:
-    name: Parity with the vela3-fast reference
+    name: Parity with the vela3-fast-multilingual reference
     runs-on: ubuntu-latest
     env:
       VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
@@ -50,7 +50,7 @@ jobs:
       - name: Build
         run: make release
 
-      - name: Download vela3-fast (ONNX export)
+      - name: Download vela3-fast-multilingual (ONNX export)
         run: |
           mkdir -p models
           base=https://assets.altertable.ai/decide_onnx/$(grep -o 'ASSET_VERSION = "[^"]*"' src/include/decide_onnx/model_manifest.hpp | cut -d'"' -f2)

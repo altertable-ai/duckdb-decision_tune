@@ -1,14 +1,17 @@
-"""Reference outputs for test/sql/parity_*.test, from the published vela3-fast code (PyTorch, CPU, fp32).
+"""Reference outputs for test/sql/parity_*.test, from the published vela3-fast code (PyTorch, CPU, fp32) running the
+vela3-fast-multilingual weights.
 
-    uv run python make_fixtures.py
+    uv run python make_fixtures.py --weights model.safetensors
 
 The decisions go through `vela3_encoder.DecisionEncoder.predict`, the code of the model repository, so the
 fixtures cover the prompt rendering (ub_d3_common.to_row) as well as the network. The tokenizer cases go through
 the same tokenizer the reference uses.
 """
+import argparse
 import csv
 import json
 import random
+from pathlib import Path
 
 from export_onnx import REPO_ROOT, load_reference
 
@@ -72,11 +75,17 @@ DECISIONS = [
     ("a  b   c    d", "Which letter comes first?", {"a": None, "b": None, "c": None, "d": None}),
     ({"order": 1234, "paid": True, "items": ["mug", "plate"], "note": None}, "Was the order paid?", None),
     ("Login loop: the app keeps asking for my password.", "Which team should handle this customer message?", TEAMS),
+    ("Bonjour, ma carte a été débitée deux fois pour le même café ce matin.",
+     "Which team should handle this customer message?", TEAMS),
+    ("Das Paket kam beschädigt an, die Tasse ist zerbrochen.", "Is the customer asking for a refund or an exchange?",
+     None),
 ]
 
 
 def main():
-    reference, _ = load_reference()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--weights", type=Path, required=True, help="the fine-tuned fp32 model.safetensors")
+    reference, _ = load_reference(parser.parse_args().weights)
     OUT.mkdir(parents=True, exist_ok=True)
     with open(OUT / "tokenizer.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)

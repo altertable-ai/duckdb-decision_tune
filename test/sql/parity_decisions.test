@@ -21,7 +21,7 @@ FROM read_csv('test/data/parity/decisions.csv', header = true, all_varchar = tru
 query I
 SELECT count(*) FROM cases;
 ----
-14
+16
 
 # On one thread, the cases share forward passes (short prompts are packed together)
 statement ok
@@ -39,13 +39,13 @@ FROM cases WHERE kind = 'choose' AND state_is_json;
 query I
 SELECT count(*) FROM results;
 ----
-9
+10
 
 # With more threads than the cases fill, the queries below run each prompt alone
 statement ok
 SET threads = 16;
 
-# Same probabilities, up to the int8 storage of the weights (the largest difference is about 0.007)
+# Same probabilities, up to the int8 storage of the weights (the largest difference is about 0.006)
 query I
 SELECT case_id FROM results
 WHERE len(expected) <> cardinality(d.probabilities)
